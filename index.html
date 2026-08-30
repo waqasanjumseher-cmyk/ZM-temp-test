@@ -8478,6 +8478,12 @@ function DeviceApprovalScreen({ status, deviceId, bizId, cloudUser, currentBiz, 
   return (
     <div className="min-h-screen flex items-center justify-center bg-slate-50 p-4">
       <div className="bg-white rounded-2xl shadow-lg border border-slate-200 p-8 max-w-sm w-full text-center">
+        {/* Reached only for an explicit "blocked" status now — an Admin clicked Block on this
+            device from Settings → Security elsewhere. "pending_approval" and "error" no longer
+            route here; they show a dismissible banner over the normal app instead (see the
+            deviceSyncPaused banner in App()), so cloud sync stays gated without hard-locking
+            anyone out of their own local data. The pending/errored branches below are kept as
+            defensive fallbacks in case this component is ever reached in those states. */}
         <div className={"w-14 h-14 rounded-full flex items-center justify-center mx-auto mb-4 text-2xl " + (pending || errored ? "bg-amber-100" : "bg-rose-100")}>
           {pending || errored ? "\u23F3" : "\u{1F6AB}"}
         </div>
@@ -9060,10 +9066,20 @@ function App() {
       </div>
     );
   }
-  if (CLOUD_ENABLED && !localTestMode && deviceApproval.status !== "approved") {
+  // Only an explicit Admin "Block" action ever produces a hard, full-app lockout. Every other
+  // non-approved state (pending_approval, error, or any future status this app doesn't recognize)
+  // falls through to the normal app below with a dismissible banner instead — cloud sync itself is
+  // still strictly gated to "approved" only via `deviceIsApproved` passed into useCloudSync above,
+  // so an unapproved/errored device can never read or write shared cloud data either way. This
+  // split exists so that a broken/misconfigured Firebase project (e.g. Firestore rules not yet
+  // published on a freshly swapped-in project, or the "Anonymous" provider not enabled) can never
+  // lock someone out of their own local data — it can only ever pause cloud sync until fixed. A
+  // device an Admin has actually clicked "Block" on is the one case that should still hard-stop.
+  if (CLOUD_ENABLED && !localTestMode && deviceApproval.status === "blocked") {
     return <DeviceApprovalScreen status={deviceApproval.status} deviceId={deviceApproval.deviceId} bizId={currentBizId} cloudUser={cloudUser} currentBiz={currentBiz} currentUser={currentUser} onLogout={handleLogout} bizName={currentBiz.name}
       isLocalEnv={IS_LOCAL_ENV} cloudAuthErrorCode={cloudAuthErrorCode} onEnableLocalTestMode={() => setLocalTestMode(true)} />;
   }
+  const deviceSyncPaused = CLOUD_ENABLED && !localTestMode && deviceApproval.status !== "approved";
 
   const compact = !!uiPrefs.compactSidebar;
   return (
@@ -9073,7 +9089,14 @@ function App() {
         {"\u26A0\uFE0F"} Environment: Local Test Mode — device approval bypassed, not connected to real cloud data
       </div>
     )}
-    <div className={"min-h-screen flex " + (localTestMode ? "pt-5 " : "") + (uiPrefs.hideUrdu ? "hide-urdu " : "") + (effectiveCustomTextColor(uiPrefs) ? "custom-text-color " : "") + (uiPrefs.boldText ? "bold-text " : "") + (uiPrefs.darkMode ? "dark-mode" : "")}>
+    {!localTestMode && deviceSyncPaused && (
+      <div className="fixed top-0 left-0 right-0 z-50 bg-sky-600 text-white text-[11px] font-medium text-center py-1 px-2">
+        {"\u2601\uFE0F"} Cloud sync paused on this device
+        {deviceApproval.status === "pending_approval" ? " — waiting for an Admin to approve it (Settings → Security)." : deviceApproval.status === "checking" ? " — checking access…" : " — couldn't verify device access (check Firestore rules/setup)."}
+        {" "}You're working locally in the meantime; nothing here is lost.
+      </div>
+    )}
+    <div className={"min-h-screen flex " + ((localTestMode || deviceSyncPaused) ? "pt-5 " : "") + (uiPrefs.hideUrdu ? "hide-urdu " : "") + (effectiveCustomTextColor(uiPrefs) ? "custom-text-color " : "") + (uiPrefs.boldText ? "bold-text " : "") + (uiPrefs.darkMode ? "dark-mode" : "")}>
       <div className={"fixed md:static z-40 md:z-0 top-0 left-0 h-full app-sidebar text-slate-200 flex flex-col transition-all " + (compact ? "w-20" : "w-64") + " " + (sidebarOpen ? "translate-x-0" : "-translate-x-full md:translate-x-0")}>
         <div className={"px-5 py-4 border-b border-slate-700 flex items-center gap-3 " + (compact ? "justify-center px-2" : "")}>
           <div className="w-10 h-10 rounded-full bg-white text-[var(--accent-700)] flex items-center justify-center font-bold text-sm flex-shrink-0 overflow-hidden">
