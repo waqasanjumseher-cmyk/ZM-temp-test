@@ -1646,6 +1646,45 @@ async function cloudEmergencyApproveDevice(bizId, deviceId, approverLabel) {
     reviewedBy: approverLabel || "Emergency access",
   }, { merge: true });
 }
+/* ---- Emergency Master Password (Tier 1 bypass, works even if Firestore is completely
+   unreachable) ----
+   Unlike the per-business Master PIN above (which lives in `currentBiz.masterPinHash`, set from
+   Settings -> Security, and therefore requires you to have already gotten past Tier 1 at least
+   once to configure it — no help on a brand-new/broken deployment) and unlike the Primary Admin
+   Email shortcut / regular device approval (both of which require a successful Firestore write to
+   take effect), this password is a single hash baked into the file itself. Checking it is 100%
+   client-side (Web Crypto only) and granting access writes only to THIS device's own localStorage
+   — no Firestore read or write required — so it works even when the devices collection can't be
+   reached at all (unpublished rules, wrong project, offline, etc.), which is exactly the situation
+   it exists for.
+   CHANGE THIS BEFORE RELYING ON IT. The default below hashes the placeholder password
+   "change-me-emergency-2026" — anyone with this file's source can already see (or brute-force) any
+   hash you put here, so treat it exactly like the Master PIN: a deterrent against a random person
+   opening the shop's link, not a vault. To set your own: open this file in a browser, open DevTools
+   Console, and run `await sha256Hex("your-new-password")` (sha256Hex is defined just above) — paste
+   the hex string it prints in as EMERGENCY_ACCESS_PASSWORD_HASH below, then reload. */
+const EMERGENCY_ACCESS_PASSWORD_HASH = "b6c1938590ed6324c25706378e64e2a3cdfc9f11f7734b90fba99a95abd555fc"; // sha256("change-me-emergency-2026") — SEE COMMENT ABOVE, replace before use
+const EMERGENCY_ACCESS_KEY = "erp_emergency_device_access";
+function loadEmergencyAccessGrants() { return loadJSON(EMERGENCY_ACCESS_KEY, {}); }
+function hasEmergencyAccessGrant(bizId) { return !!loadEmergencyAccessGrants()[bizId]; }
+/* Verifies the entered password against EMERGENCY_ACCESS_PASSWORD_HASH. On success: (1) grants
+   this device local, offline-proof access to this business immediately by writing to localStorage
+   (this is what actually unblocks the UI — see the `emergencyAccess` check in App()), and (2) makes
+   a best-effort attempt to also register the device as "approved" in Firestore so cloud sync starts
+   working too and other devices/Admins can see it in Settings -> Security — but that attempt is
+   fire-and-forget and its failure (e.g. Firestore still unreachable) does NOT affect whether access
+   is granted, unlike the Master PIN / Primary Admin flows above which depend on it succeeding. */
+async function tryEmergencyAccessPassword(password, bizId, deviceId, cloudUser) {
+  const entered = await sha256Hex((password || "").trim());
+  if (entered !== EMERGENCY_ACCESS_PASSWORD_HASH) return false;
+  const grants = loadEmergencyAccessGrants();
+  grants[bizId] = { grantedAt: new Date().toISOString(), deviceId };
+  saveJSON(EMERGENCY_ACCESS_KEY, grants);
+  if (CLOUD_ENABLED && fbDb && cloudUser && bizId && deviceId) {
+    cloudEmergencyApproveDevice(bizId, deviceId, "Emergency master password").catch(() => {});
+  }
+  return true;
+}
 /* Registers this device on login and keeps listening live so an approval/block from another
    device takes effect immediately, without needing a reload. STRICT / fail-CLOSED: only a
    confirmed "approved" status read back from Firestore ever grants access — "checking",
@@ -8454,13 +8493,17 @@ function ForgotPasswordPanel({ users, onResetPassword, onBack }) {
   );
 }
 
-function DeviceApprovalScreen({ status, deviceId, bizId, cloudUser, currentBiz, currentUser, onLogout, bizName, isLocalEnv, cloudAuthErrorCode, onEnableLocalTestMode }) {
+function DeviceApprovalScreen({ status, deviceId, bizId, cloudUser, currentBiz, currentUser, onLogout, bizName, isLocalEnv, cloudAuthErrorCode, onEnableLocalTestMode, onEmergencyAccessGranted }) {
   const pending = status === "pending_approval";
   const errored = status === "error";
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState(null); // { type: "error"|"info", text }
   const [pinOpen, setPinOpen] = useState(false);
   const [pin, setPin] = useState("");
+  const [pwOpen, setPwOpen] = useState(false);
+  const [pw, setPw] = useState("");
+  const [pwBusy, setPwBusy] = useState(false);
+  const [pwMsg, setPwMsg] = useState(null);
 
   const primaryEmail = currentBiz && currentBiz.primaryAdminEmail;
   const isPrimaryAdmin = !!(cloudUser && cloudUser.email && primaryEmail && cloudUser.email.toLowerCase() === primaryEmail.toLowerCase());
@@ -8487,6 +8530,25 @@ function DeviceApprovalScreen({ status, deviceId, bizId, cloudUser, currentBiz, 
     } catch (err) {
       setMsg({ type: "error", text: "Something went wrong: " + err.message });
       setBusy(false);
+    }
+  }
+
+  /* Emergency Master Password — the one option on this screen that needs no Firestore access at
+     all (see tryEmergencyAccessPassword above). This is the option to reach for when the Primary
+     Admin shortcut isn't available and the Master PIN keeps failing to save because Firestore
+     itself can't be reached — that's exactly the scenario this exists for. */
+  async function tryEmergencyPassword() {
+    if (!pw.trim()) return;
+    setPwBusy(true); setPwMsg(null);
+    try {
+      const ok = await tryEmergencyAccessPassword(pw, bizId, deviceId, cloudUser);
+      if (!ok) { setPwMsg({ type: "error", text: "Incorrect password." }); setPwBusy(false); return; }
+      setPwMsg({ type: "info", text: "Unlocked — loading this device now." });
+      setPw("");
+      if (onEmergencyAccessGranted) onEmergencyAccessGranted();
+    } catch (err) {
+      setPwMsg({ type: "error", text: "Something went wrong: " + err.message });
+      setPwBusy(false);
     }
   }
 
@@ -8526,6 +8588,27 @@ function DeviceApprovalScreen({ status, deviceId, bizId, cloudUser, currentBiz, 
             </button>
           </div>
         )}
+
+        {/* Works even when Firestore can't be reached at all (unpublished rules, wrong project,
+            offline) — see tryEmergencyAccessPassword above. This is usually the option to try
+            first if the Master PIN below keeps failing to save. */}
+        <div className="text-left mb-3">
+          <button onClick={() => setPwOpen(o => !o)} className="text-[11px] text-slate-400 hover:text-slate-600 hover:underline">
+            {pwOpen ? "Hide emergency access" : "Emergency access (Master Password)"}
+          </button>
+          {pwOpen && (
+            <div className="mt-2">
+              <div className="flex gap-2">
+                <input type="password" value={pw} onChange={e => setPw(e.target.value)} onKeyDown={e => e.key === "Enter" && tryEmergencyPassword()}
+                  placeholder="Emergency master password" className="flex-1 border border-slate-300 rounded-lg px-2.5 py-1.5 text-sm" />
+                <button onClick={tryEmergencyPassword} disabled={pwBusy || !pw.trim()} className="text-xs font-medium px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-900 text-white disabled:opacity-50">
+                  {pwBusy ? "..." : "Unlock"}
+                </button>
+              </div>
+              {pwMsg && <p className={"text-xs mt-1.5 " + (pwMsg.type === "error" ? "text-rose-600" : "text-emerald-600")}>{pwMsg.text}</p>}
+            </div>
+          )}
+        </div>
 
         {hasMasterPin && (
           <div className="text-left mb-3">
@@ -8920,6 +9003,11 @@ function App() {
   // tells the App-level render gate to skip the device-approval screen so local UI testing isn't
   // blocked by a check that can never actually succeed without a real, authorized origin.
   const [localTestMode, setLocalTestMode] = useState(false);
+  // Emergency Master Password grant (see tryEmergencyAccessPassword above) — persisted per business
+  // in localStorage so it survives reloads, unlike localTestMode. Re-checked whenever the active
+  // business changes, since a grant on one business's data doesn't carry over to another.
+  const [emergencyAccess, setEmergencyAccess] = useState(() => hasEmergencyAccessGrant(currentBizId));
+  useEffect(() => { setEmergencyAccess(hasEmergencyAccessGrant(currentBizId)); }, [currentBizId]);
   const autoCloudAuthTried = useRef(false);
   useEffect(() => {
     if (!CLOUD_ENABLED) return;
@@ -9056,7 +9144,7 @@ function App() {
      testing only. Even with Tier 1 bypassed this way, Tier 2 (the Login Screen) still always
      applies — Local Test Mode never skips the login step.
      ====================================================================== */
-  if (CLOUD_ENABLED && !localTestMode && deviceApproval.status === "checking") {
+  if (CLOUD_ENABLED && !localTestMode && !emergencyAccess && deviceApproval.status === "checking") {
     if (checkingTooLong) {
       const unauthorizedDomain = cloudAuthErrorCode === "auth/unauthorized-domain";
       return (
@@ -9104,12 +9192,16 @@ function App() {
   // "not allowed" should look identical to someone trying to get in. The trade-off is that a
   // broken/misconfigured Firebase project (unpublished Firestore rules, Anonymous auth disabled,
   // etc.) will also show this screen — that's why the emergency self-approve options inside
-  // DeviceApprovalScreen (Primary Admin Email shortcut, Emergency Master PIN) and Local Test Mode
-  // below all remain available as escape hatches; see the note above FIREBASE_CONFIG for the setup
-  // checklist that prevents this from happening on a freshly swapped-in project.
-  if (CLOUD_ENABLED && !localTestMode && deviceApproval.status !== "approved") {
+  // DeviceApprovalScreen (Primary Admin Email shortcut, Emergency Master PIN, and the Emergency
+  // Master Password, which unlike the other two needs no Firestore access at all) and Local Test
+  // Mode below all remain available as escape hatches; see the note above FIREBASE_CONFIG for the
+  // setup checklist that prevents this from happening on a freshly swapped-in project.
+  // `emergencyAccess` (from EMERGENCY_ACCESS_PASSWORD_HASH, see its definition above) is checked
+  // here too so a device that unlocked itself with the master password on a PRIOR load doesn't
+  // have to re-enter it — the grant persists per-business in localStorage.
+  if (CLOUD_ENABLED && !localTestMode && !emergencyAccess && deviceApproval.status !== "approved") {
     return <DeviceApprovalScreen status={deviceApproval.status} deviceId={deviceApproval.deviceId} bizId={currentBizId} cloudUser={cloudUser} currentBiz={currentBiz} currentUser={currentUser} onLogout={handleLogout} bizName={currentBiz.name}
-      isLocalEnv={IS_LOCAL_ENV} cloudAuthErrorCode={cloudAuthErrorCode} onEnableLocalTestMode={() => setLocalTestMode(true)} />;
+      isLocalEnv={IS_LOCAL_ENV} cloudAuthErrorCode={cloudAuthErrorCode} onEnableLocalTestMode={() => setLocalTestMode(true)} onEmergencyAccessGranted={() => setEmergencyAccess(true)} />;
   }
 
   // Tier 2 enforcement: device is approved (or Local Test Mode is bypassing Tier 1 for UI testing)
