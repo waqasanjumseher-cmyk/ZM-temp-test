@@ -462,7 +462,7 @@ function defaultUiPrefs() {
   // customTheme: Phase 4 Theme & Color Customizer — empty string on any field means "not set, use
   // the preset accent theme / built-in default" so a user who never opens the customizer sees
   // exactly the same look as before this feature existed.
-  return { tabs, dashboard, theme: "indigo", defaultTab: "dashboard", hideUrdu: false, compactSidebar: false, darkMode: false, boldText: false, fontSize: "medium", dashboardOrder: null, customTheme: { bg: "", navbar: "", button: "", text: "" }, dashboardPrivacyMode: true, customerList: { zebraStripe: false, showCnic: true, showGuarantor: true, showLastActivity: true } };
+  return { tabs, dashboard, theme: "indigo", defaultTab: "dashboard", hideUrdu: false, compactSidebar: false, darkMode: false, boldText: false, fontSize: "medium", dashboardOrder: null, customTheme: { bg: "", navbar: "", button: "", text: "" }, dashboardPrivacyMode: true, customerList: { showCnic: true, showGuarantor: true, showLastActivity: true }, zebraStripe: { customers: false, dealerLedger: false, inventory: false, purchases: false, recoveries: false } };
 }
 /* Keyed by USER id (falls back gracefully if a saved file used the old per-business key shape —
    any old data just isn't found, and this simply starts that user off at the defaults). */
@@ -471,7 +471,13 @@ function loadUiPrefs(userId) {
   if (!userId) return def;
   const saved = loadJSON(UI_PREFS_KEY(userId), null);
   if (!saved) return def;
-  return { ...def, ...saved, tabs: { ...def.tabs, ...(saved.tabs || {}) }, dashboard: { ...def.dashboard, ...(saved.dashboard || {}) }, customTheme: { ...def.customTheme, ...(saved.customTheme || {}) }, customerList: { ...def.customerList, ...(saved.customerList || {}) } };
+  // Migration: zebra striping used to live only at customerList.zebraStripe (Customers tab only);
+  // it's now a unified per-tab zebraStripe object covering Customers, Dealer Ledger, Inventory,
+  // Purchases, and Recoveries. Seed the new customers flag from the old location if someone had
+  // already turned it on there, so upgrading this file doesn't silently switch it back off — but
+  // once the new field itself has been saved (even once), that value wins going forward.
+  const migratedCustomersZebra = !!(saved.customerList && saved.customerList.zebraStripe);
+  return { ...def, ...saved, tabs: { ...def.tabs, ...(saved.tabs || {}) }, dashboard: { ...def.dashboard, ...(saved.dashboard || {}) }, customTheme: { ...def.customTheme, ...(saved.customTheme || {}) }, customerList: { ...def.customerList, ...(saved.customerList || {}) }, zebraStripe: { ...def.zebraStripe, customers: migratedCustomersZebra, ...(saved.zebraStripe || {}) } };
 }
 
 /* ======================================================================
@@ -1182,12 +1188,13 @@ function deviceLabel() {
    device is back online. Nothing about local-first behaviour is lost by turning this on.
    ====================================================================== */
 const FIREBASE_CONFIG = {
-  apiKey: "AIzaSyBTQ1niFKVyl9xPyj1Ld4hK3B9nUgrixb8",
-  authDomain: "zahidi-mobiles.firebaseapp.com",
-  projectId: "zahidi-mobiles",
-  storageBucket: "zahidi-mobiles.firebasestorage.app",
-  messagingSenderId: "305729845130",
-  appId: "1:305729845130:web:6dfd1edbff7b2414c53a73",
+  apiKey: "AIzaSyBATRzmZUv1T39tJgTDCnv9ZKEoP7MKREc",
+  authDomain: "zm92-1bb61.firebaseapp.com",
+  projectId: "zm92-1bb61",
+  storageBucket: "zm92-1bb61.firebasestorage.app",
+  messagingSenderId: "3171034650",
+  appId: "1:3171034650:web:f86e5e2409a9ec521053a3",
+  measurementId: "G-GVTXED6H09",
 };
 /* ---- In-app Firebase settings (Business Settings -> Cloud Sync, Admin only) ----
    Lets an Admin swap in their OWN Firebase project's keys, or fully turn cloud sync off, without
@@ -3601,8 +3608,9 @@ function buildStockSummary(items) {
   });
   return { byCategory, categoryOrder };
 }
-function InventoryTab({ data, setData, role, dealers, biz, erpSettings, can }) {
+function InventoryTab({ data, setData, role, dealers, biz, erpSettings, can, uiPrefs }) {
   const canAdd = can("add"), canEdit = can("edit"), canDelete = can("delete");
+  const zebraOn = !!(uiPrefs && uiPrefs.zebraStripe && uiPrefs.zebraStripe.inventory);
   const [query, setQuery] = useState("");
   const [filterDealer, setFilterDealer] = useState("");
   const [filterStatus, setFilterStatus] = useState("");
@@ -3725,8 +3733,8 @@ function InventoryTab({ data, setData, role, dealers, biz, erpSettings, can }) {
             <tr><th className="text-left px-3 py-2">Item</th><th className="text-left px-3 py-2">Category</th><th className="text-left px-3 py-2">IMEI 1</th><th className="text-left px-3 py-2">Condition</th><th className="text-left px-3 py-2">Dealer</th><th className="text-left px-3 py-2">Retail Price</th><th className="text-left px-3 py-2">Status</th><th className="text-left px-3 py-2">Actions</th></tr>
           </thead>
           <tbody>
-            {pagedInventory.map(i => (
-              <tr key={i.id} className="border-t border-slate-100 hover:bg-slate-50">
+            {pagedInventory.map((i, idx) => (
+              <tr key={i.id} className={"border-t-2 border-slate-300 hover:bg-slate-50" + (zebraOn && idx % 2 === 1 ? " bg-slate-50" : " bg-white")}>
                 <td className="px-3 py-2"><div className="font-medium text-slate-800">{i.itemName}</div><div className="text-xs text-slate-400">{i.brand} {i.model}</div></td>
                 <td className="px-3 py-2">{i.category}</td>
                 <td className="px-3 py-2 font-mono text-xs">{i.imei1 || "-"}</td>
@@ -3809,8 +3817,9 @@ function dealerLastTxnDate(data, dealerId) {
   ].filter(Boolean);
   return dates.length ? dates.sort().slice(-1)[0] : null;
 }
-function DealersTab({ data, setData, role, can }) {
+function DealersTab({ data, setData, role, can, uiPrefs }) {
   const canAdd = can("add"), canEdit = can("edit"), canDelete = can("delete");
+  const zebraOn = !!(uiPrefs && uiPrefs.zebraStripe && uiPrefs.zebraStripe.dealerLedger);
   const [showForm, setShowForm] = useState(false);
   const [editing, setEditing] = useState(null);
   const [dealer, setDealer] = useState(blankDealer());
@@ -3904,11 +3913,11 @@ function DealersTab({ data, setData, role, can }) {
             <th className="text-left px-3 py-2">Dealer</th><th className="text-left px-3 py-2">Contact</th><th className="text-left px-3 py-2">Phone</th><th className="text-left px-3 py-2">City</th><th className="text-left px-3 py-2">Balance Payable</th><th className="text-left px-3 py-2">Last Transaction</th><th className="text-left px-3 py-2">Actions</th>
           </tr></thead>
           <tbody>
-            {filtered.map(d => {
+            {filtered.map((d, idx) => {
               const isOpen = expandedDealerId === d.id;
               return (
                 <React.Fragment key={d.id}>
-                  <tr className={"border-t border-slate-100 hover:bg-slate-50 cursor-pointer" + (isOpen ? " bg-slate-50" : "")} onClick={() => toggleExpand(d.id)}>
+                  <tr className={"border-t-2 border-slate-300 hover:bg-slate-50 cursor-pointer" + (isOpen ? " bg-slate-50" : (zebraOn && idx % 2 === 1 ? " bg-slate-50" : " bg-white"))} onClick={() => toggleExpand(d.id)}>
                     <td className="px-3 py-2 text-slate-400">
                       <span className={"inline-block transition-transform duration-150" + (isOpen ? " rotate-90" : "")}>&#9656;</span>
                     </td>
@@ -4033,8 +4042,9 @@ function DealersTab({ data, setData, role, can }) {
 
 /* ============================ PURCHASES TAB ============================ */
 function blankBulk() { return { itemName: "", brand: "", model: "", category: "Mobile", condition: "New", ram: "", storage: "", color: "", purchasePrice: "", retailPrice: "", minPrice: "", imeisText: "", quantity: "1" }; }
-function PurchasesTab({ data, setData, role, biz, erpSettings, can }) {
+function PurchasesTab({ data, setData, role, biz, erpSettings, can, uiPrefs }) {
   const canAdd = can("add"), canEdit = can("edit"), canDelete = can("delete");
+  const zebraOn = !!(uiPrefs && uiPrefs.zebraStripe && uiPrefs.zebraStripe.purchases);
   const bizType = biz.businessType || "general";
   const purchaseFieldsUI = useFormCustomization(biz.id, bizType, "purchase");
   const [showForm, setShowForm] = useState(false);
@@ -4137,11 +4147,11 @@ function PurchasesTab({ data, setData, role, biz, erpSettings, can }) {
         <table className="w-full text-sm">
           <thead className="bg-slate-50 text-slate-500 uppercase text-xs"><tr><th className="text-left px-3 py-2">Date</th><th className="text-left px-3 py-2">Dealer</th><th className="text-left px-3 py-2">Invoice #</th><th className="text-left px-3 py-2">Total</th><th className="text-left px-3 py-2">Paid</th><th className="text-left px-3 py-2">Remaining</th><th className="text-left px-3 py-2">Items</th><th className="text-left px-3 py-2">Actions</th></tr></thead>
           <tbody>
-            {[...data.purchases].sort((a, b) => (b.date || "").localeCompare(a.date || "")).map(p => {
+            {[...data.purchases].sort((a, b) => (b.date || "").localeCompare(a.date || "")).map((p, idx) => {
               const paid = (Number(p.cashPaid) || 0) + (Number(p.onlinePaid) || 0);
               const rem = (Number(p.totalAmount) || 0) - paid;
               return (
-                <tr key={p.id} className="border-t border-slate-100 hover:bg-slate-50">
+                <tr key={p.id} className={"border-t-2 border-slate-300 hover:bg-slate-50" + (zebraOn && idx % 2 === 1 ? " bg-slate-50" : " bg-white")}>
                   <td className="px-3 py-2">{fmtDate(p.date)}</td><td className="px-3 py-2">{data.dealers.find(d => d.id === p.dealerId)?.name || "-"}</td><td className="px-3 py-2">{p.invoiceNumber}</td>
                   <td className="px-3 py-2">{fmtMoney(p.totalAmount)}</td><td className="px-3 py-2">{fmtMoney(paid)}</td>
                   <td className={"px-3 py-2 font-medium " + (rem > 0 ? "text-rose-600" : "text-emerald-600")}>{fmtMoney(rem)}</td>
@@ -5310,7 +5320,8 @@ function CustomersTab({ data, setData, role, biz, currentUserName, erpSettings, 
   // Column visibility + zebra striping (Settings -> Display Preferences -> Customer List Display).
   // Defaults keep every column visible / stripes off, matching pre-existing behavior for anyone
   // who hasn't touched these settings.
-  const listPrefs = (uiPrefs && uiPrefs.customerList) || { zebraStripe: false, showCnic: true, showGuarantor: true, showLastActivity: true };
+  const listPrefs = (uiPrefs && uiPrefs.customerList) || { showCnic: true, showGuarantor: true, showLastActivity: true };
+  const zebraOn = !!(uiPrefs && uiPrefs.zebraStripe && uiPrefs.zebraStripe.customers);
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
   const [sort, setSort] = useState("name:asc");
@@ -5406,7 +5417,7 @@ function CustomersTab({ data, setData, role, biz, currentUserName, erpSettings, 
           </tr></thead>
           <tbody>
             {pagedCustomers.map((c, idx) => (
-              <tr key={c.id} className={"border-t-2 border-slate-300 hover:bg-slate-50" + (listPrefs.zebraStripe && idx % 2 === 1 ? " bg-slate-50" : " bg-white")}>
+              <tr key={c.id} className={"border-t-2 border-slate-300 hover:bg-slate-50" + (zebraOn && idx % 2 === 1 ? " bg-slate-50" : " bg-white")}>
                 <td className="px-3 py-2 font-medium text-slate-800 max-w-[140px] sm:max-w-none whitespace-normal break-words align-top">
                   <span className={containsUrdu(c.name) ? "urdu" : ""}>{c.name}</span>
                 </td>
@@ -5570,7 +5581,8 @@ function CustomersTab({ data, setData, role, biz, currentUserName, erpSettings, 
 }
 
 /* ============================ RECOVERY TAB ============================ */
-function RecoveryTab({ data, setData, biz, currentUserName, can }) {
+function RecoveryTab({ data, setData, biz, currentUserName, can, uiPrefs }) {
+  const zebraOn = !!(uiPrefs && uiPrefs.zebraStripe && uiPrefs.zebraStripe.recoveries);
   const pending = useMemo(() => data.sales.filter(s => s.paymentType === "Installment").map(s => {
     const credit = saleCredit(s);
     const next = nextDueInfo(s);
@@ -5650,11 +5662,11 @@ function RecoveryTab({ data, setData, biz, currentUserName, can }) {
         <table className="w-full text-sm">
           <thead className="bg-slate-50 text-slate-500 uppercase text-xs"><tr><th className="text-left px-3 py-2">Customer</th><th className="text-left px-3 py-2">Item</th><th className="text-left px-3 py-2">Sale Price</th><th className="text-left px-3 py-2">Paid</th><th className="text-left px-3 py-2">Remaining</th><th className="text-left px-3 py-2">Status</th><th className="text-left px-3 py-2"></th></tr></thead>
           <tbody>
-            {filtered.map(s => {
+            {filtered.map((s, idx) => {
               const badge = s.statusTag === "overdue" ? { text: "Overdue", cls: "bg-rose-100 text-rose-700" } : s.statusTag === "dueSoon" ? { text: "Due Soon", cls: "bg-amber-100 text-amber-700" } : { text: "On Track", cls: "bg-emerald-100 text-emerald-700" };
               return (
                 <React.Fragment key={s.id}>
-                  <tr className="border-t border-slate-100 hover:bg-slate-50 cursor-pointer" onClick={() => setExpanded(expanded === s.id ? null : s.id)}>
+                  <tr className={"border-t-2 border-slate-300 hover:bg-slate-50 cursor-pointer" + (zebraOn && idx % 2 === 1 ? " bg-slate-50" : " bg-white")} onClick={() => setExpanded(expanded === s.id ? null : s.id)}>
                     <td className="px-3 py-2">{s.customerName || "-"} <div className="text-xs text-slate-400">{s.customerPhone}</div></td>
                     <td className="px-3 py-2">{saleItemsLabel(s, data)}</td>
                     <td className="px-3 py-2">{fmtMoney(s.salePrice)}</td>
@@ -7005,6 +7017,7 @@ function SettingsTab({ businesses, setBusinesses, currentBiz, setCurrentBizId, u
   function toggleBoldText(checked) { setUiPrefs({ ...uiPrefs, boldText: checked }); }
   function setFontSize(size) { setUiPrefs({ ...uiPrefs, fontSize: size }); }
   function toggleCustomerListPref(field, checked) { setUiPrefs({ ...uiPrefs, customerList: { ...(uiPrefs.customerList || {}), [field]: checked } }); }
+  function toggleZebraStripe(area, checked) { setUiPrefs({ ...uiPrefs, zebraStripe: { ...(uiPrefs.zebraStripe || {}), [area]: checked } }); }
   /* Applies this business type's recommended tab visibility (see BUSINESS_PRESETS
      .recommendedHiddenTabs) on top of the user's current choices — a starting point, not a lock;
      any tab can still be toggled back on right after. */
@@ -7401,10 +7414,21 @@ function SettingsTab({ businesses, setBusinesses, currentBiz, setCurrentBizId, u
         <h3 className="text-sm font-semibold text-slate-700 mb-1">Customer List Display</h3>
         <p className="text-xs text-slate-500 mb-3">Controls the Customers tab list only — the full customer profile/ledger always shows every detail regardless of these settings.</p>
         <div className="divide-y divide-slate-100">
-          <ToggleSwitch label="Zebra striping (alternating row backgrounds)" ur="متبادل قطار کا پس منظر" checked={!!(uiPrefs.customerList || {}).zebraStripe} onChange={(v) => toggleCustomerListPref("zebraStripe", v)} />
           <ToggleSwitch label="Show CNIC column" ur="شناختی کارڈ کالم دکھائیں" checked={(uiPrefs.customerList || {}).showCnic !== false} onChange={(v) => toggleCustomerListPref("showCnic", v)} />
           <ToggleSwitch label="Show Guarantor column" ur="ضامن کالم دکھائیں" checked={(uiPrefs.customerList || {}).showGuarantor !== false} onChange={(v) => toggleCustomerListPref("showGuarantor", v)} />
           <ToggleSwitch label="Show Last Activity column" ur="آخری سرگرمی کالم دکھائیں" checked={(uiPrefs.customerList || {}).showLastActivity !== false} onChange={(v) => toggleCustomerListPref("showLastActivity", v)} />
+        </div>
+      </div>
+
+      <div className="bg-white rounded-xl border border-slate-200 p-5 mb-6">
+        <h3 className="text-sm font-semibold text-slate-700 mb-1">Row Styling / Zebra Striping</h3>
+        <p className="text-xs text-slate-500 mb-3">Alternating row backgrounds to make long lists easier to scan. Row dividers are thicker and higher-contrast everywhere now, regardless of this setting.</p>
+        <div className="divide-y divide-slate-100">
+          <ToggleSwitch label="Customers" ur="گاہک" checked={!!(uiPrefs.zebraStripe || {}).customers} onChange={(v) => toggleZebraStripe("customers", v)} />
+          <ToggleSwitch label="Dealer / Supplier Ledger" ur="ڈیلر کھاتہ" checked={!!(uiPrefs.zebraStripe || {}).dealerLedger} onChange={(v) => toggleZebraStripe("dealerLedger", v)} />
+          <ToggleSwitch label="Inventory" ur="اسٹاک" checked={!!(uiPrefs.zebraStripe || {}).inventory} onChange={(v) => toggleZebraStripe("inventory", v)} />
+          <ToggleSwitch label="Purchases" ur="خریداری" checked={!!(uiPrefs.zebraStripe || {}).purchases} onChange={(v) => toggleZebraStripe("purchases", v)} />
+          <ToggleSwitch label="Recoveries / Installments" ur="وصولیاں" checked={!!(uiPrefs.zebraStripe || {}).recoveries} onChange={(v) => toggleZebraStripe("recoveries", v)} />
         </div>
       </div>
       </>
@@ -8967,13 +8991,13 @@ function App() {
   function renderTab() {
     switch (activeTab) {
       case "dashboard": return <Dashboard data={data} role={role} visible={uiPrefs.dashboard} order={uiPrefs.dashboardOrder} erpSettings={erpFeatures.settings} uiPrefs={uiPrefs} setUiPrefs={setUiPrefs} />;
-      case "inventory": return <InventoryTab data={data} setData={setData} role={role} dealers={data.dealers} biz={currentBiz} erpSettings={erpFeatures.settings} can={a => canDo("inventory", a)} />;
-      case "dealers": return <DealersTab data={data} setData={setData} role={role} can={a => canDo("dealers", a)} />;
-      case "purchases": return <PurchasesTab data={data} setData={setData} role={role} biz={currentBiz} erpSettings={erpFeatures.settings} can={a => canDo("purchases", a)} />;
+      case "inventory": return <InventoryTab data={data} setData={setData} role={role} dealers={data.dealers} biz={currentBiz} erpSettings={erpFeatures.settings} can={a => canDo("inventory", a)} uiPrefs={uiPrefs} />;
+      case "dealers": return <DealersTab data={data} setData={setData} role={role} can={a => canDo("dealers", a)} uiPrefs={uiPrefs} />;
+      case "purchases": return <PurchasesTab data={data} setData={setData} role={role} biz={currentBiz} erpSettings={erpFeatures.settings} can={a => canDo("purchases", a)} uiPrefs={uiPrefs} />;
       case "settings": return <SettingsTab businesses={businesses} setBusinesses={setBusinesses} currentBiz={currentBiz} setCurrentBizId={setCurrentBizId} users={users} setUsers={setUsers} currentUser={currentUser} cloudUser={cloudUser} cloudAuthError={cloudAuthError} onCloudLogout={handleCloudLogout} cloudStatus={cloudStatus} isOnline={isOnline} onSyncNow={handleSyncNow} data={data} setData={setData} uiPrefs={uiPrefs} setUiPrefs={setUiPrefs} erpSettings={erpFeatures.settings} updateErpSetting={erpFeatures.updateSetting} />;
       case "sales": return <SalesTab data={data} setData={setData} role={role} currentUserName={currentUser.name} biz={currentBiz} erpSettings={erpFeatures.settings} can={a => canDo("sales", a)} />;
       case "customers": return <CustomersTab data={data} setData={setData} role={role} biz={currentBiz} currentUserName={currentUser.name} erpSettings={erpFeatures.settings} can={a => canDo("customers", a)} uiPrefs={uiPrefs} />;
-      case "recovery": return <RecoveryTab data={data} setData={setData} biz={currentBiz} currentUserName={currentUser.name} can={a => canDo("recovery", a)} />;
+      case "recovery": return <RecoveryTab data={data} setData={setData} biz={currentBiz} currentUserName={currentUser.name} can={a => canDo("recovery", a)} uiPrefs={uiPrefs} />;
       case "accounts": return <AccountsTab data={data} setData={setData} role={role} can={a => canDo("accounts", a)} />;
       case "staff": return <StaffTab data={data} setData={setData} role={role} can={a => canDo("staff", a)} />;
       case "expenses": return <ExpensesTab data={data} setData={setData} can={a => canDo("expenses", a)} />;
