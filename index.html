@@ -1315,7 +1315,7 @@ service cloud.firestore {
       // Device Approval to actually restrict anything — until this is pasted in, registration and
       // status checks fail closed-but-open (see useDeviceApproval's fail-open comment), meaning
       // every device is effectively treated as approved.
-      match /devices/{deviceId} {
+      match /approved_devices/{deviceId} {
         allow read, write: if request.auth != null &&
           exists(/databases/$(database)/documents/businesses/$(bizId)/members/$(request.auth.uid));
       }
@@ -1585,7 +1585,7 @@ function cloudEnsureMembership(bizId, uid) {
    which this project doesn't use), so treat this as a real deterrent against someone opening the
    shop's link on a random device, not as airtight security against a determined attacker who can
    read/edit this file's own source. */
-function cloudDevicesCollectionRef(bizId) { return cloudBizDocRef(bizId).collection("devices"); }
+function cloudDevicesCollectionRef(bizId) { return cloudBizDocRef(bizId).collection("approved_devices"); }
 function cloudDeviceDocRef(bizId, deviceId) { return cloudDevicesCollectionRef(bizId).doc(deviceId); }
 async function cloudRegisterDevice(bizId, deviceId, userInfo) {
   if (!CLOUD_ENABLED || !fbDb || !bizId || !deviceId) return "disabled";
@@ -1633,7 +1633,7 @@ async function sha256Hex(text) {
 }
 /* Self-approve THIS device — used by both the Primary Admin Email shortcut and the Emergency
    Master PIN unlock on the blocked screen. Writes straight to Firestore rather than going through
-   an Admin's separate device; if this write itself fails (most likely: the devices-subcollection
+   an Admin's separate device; if this write itself fails (most likely: the approved_devices-subcollection
    Firestore rule hasn't been pasted into the Console yet), the caller shows that specific guidance
    rather than a generic error, since this exact write is the one most likely to fail on a brand-new
    deployment. */
@@ -1650,16 +1650,24 @@ async function cloudEmergencyApproveDevice(bizId, deviceId, approverLabel) {
    device takes effect immediately, without needing a reload. STRICT / fail-CLOSED: only a
    confirmed "approved" status read back from Firestore ever grants access — "checking",
    "pending_approval", "blocked", and "error" (registration/listener failure, most likely because
-   the devices-subcollection Firestore rule below hasn't been pasted into the Console yet) are ALL
+   the approved_devices-subcollection Firestore rule below hasn't been pasted into the Console yet) are ALL
    treated as not-approved by the caller (App component) and by useCloudSync's `deviceApproved`
    gate. This is a deliberate change from an earlier fail-open design: if you're setting this up
    fresh, make sure FIRESTORE_RULES_REFERENCE's devices rule is live BEFORE relying on this, or
    every device (including the first/bootstrap one) can end up stuck on the block screen. */
+/* Two-Tier Authentication Architecture — Step 1 (Device Level Security).
+   This hook deliberately does NOT depend on `currentUser` — it must resolve BEFORE anyone has
+   logged in, since the device-approval gate in App() now runs ahead of the User Login Screen
+   (Step 2). `currentUser` is accepted only to attach a friendly "lastUser" label to the device
+   record when someone happens to already be logged in (e.g. re-checking mid-session after a
+   business switch); it's optional and the whole flow works fine when it's null. STRICT / fail-
+   closed: "checking", "pending_approval", "blocked", and "error" are all treated as NOT approved
+   by the caller — only a confirmed "approved" read back from Firestore ever unlocks Step 2. */
 function useDeviceApproval(bizId, cloudUser, currentUser) {
   const deviceId = useMemo(() => getOrCreateDeviceId(), []);
   const [status, setStatus] = useState(CLOUD_ENABLED ? "checking" : "disabled");
   useEffect(() => {
-    if (!CLOUD_ENABLED || !cloudUser || !bizId || !currentUser) { setStatus(CLOUD_ENABLED ? "checking" : "disabled"); return; }
+    if (!CLOUD_ENABLED || !cloudUser || !bizId) { setStatus(CLOUD_ENABLED ? "checking" : "disabled"); return; }
     let cancelled = false, unsub = null;
     setStatus("checking");
     (async () => {
@@ -1670,9 +1678,9 @@ function useDeviceApproval(bizId, cloudUser, currentUser) {
         // before membership exists yet (both effects fire together and neither awaits the other),
         // which the Firestore rule below would reject. Harmless if it's already been created.
         await cloudEnsureMembership(bizId, cloudUser.uid);
-        initial = await cloudRegisterDevice(bizId, deviceId, { name: currentUser.name, username: currentUser.username });
+        initial = await cloudRegisterDevice(bizId, deviceId, currentUser ? { name: currentUser.name, username: currentUser.username } : { name: "(not logged in yet)", username: "" });
       } catch (err) {
-        console.warn("Device registration failed (failing open):", err.message);
+        console.warn("Device registration failed:", err.message);
         if (!cancelled) setStatus("error");
         return;
       }
@@ -1680,11 +1688,18 @@ function useDeviceApproval(bizId, cloudUser, currentUser) {
       setStatus(initial);
       unsub = cloudDeviceDocRef(bizId, deviceId).onSnapshot(
         snap => { if (snap.exists) setStatus(snap.data().status || "pending_approval"); },
-        err => console.warn("Device status listener failed (failing open):", err.message)
+        err => console.warn("Device status listener failed:", err.message)
       );
     })();
     return () => { cancelled = true; if (unsub) unsub(); };
-  }, [bizId, cloudUser, currentUser && currentUser.id]);
+  }, [bizId, cloudUser]);
+  // Once someone logs in (Step 2), silently refresh the device record's "lastUser" label so the
+  // Security panel shows who's actually using an already-approved device — purely cosmetic, never
+  // re-gates status, so it can't interfere with the strict check above.
+  useEffect(() => {
+    if (!CLOUD_ENABLED || !cloudUser || !bizId || !currentUser || status !== "approved") return;
+    cloudRegisterDevice(bizId, deviceId, { name: currentUser.name, username: currentUser.username }).catch(() => {});
+  }, [currentUser && currentUser.id, status]);
   return { status, deviceId };
 }
 /* Pushes the local `data` blob to Firestore. Safe to call while offline — the SDK queues the
@@ -6798,9 +6813,9 @@ function SettingsDashboardCard({ icon, title, subtitle, description, onClick }) 
    data (same reasoning as why members/{uid} lives in its own subcollection rather than in `data`). */
 /* First-Admin lockout safety net (Settings -> Security, Admin-only). Both fields live on the
    business record itself (synced via the same shared businesses-list mechanism that already
-   powers cross-device business discovery) rather than in the newer devices subcollection — so
+   powers cross-device business discovery) rather than in the newer approved_devices subcollection — so
    BOTH recovery paths below keep working even in the exact scenario they exist for: a fresh
-   Firestore where the businesses/{bizId}/devices rule hasn't been pasted in yet, or is otherwise
+   Firestore where the businesses/{bizId}/approved_devices rule hasn't been pasted in yet, or is otherwise
    misbehaving. Set these up on an already-approved device BEFORE you need them. */
 function EmergencyAccessSettingsPanel({ currentBiz, businesses, setBusinesses, currentUser }) {
   const [email, setEmail] = useState(currentBiz.primaryAdminEmail || "");
@@ -8457,7 +8472,7 @@ function DeviceApprovalScreen({ status, deviceId, bizId, cloudUser, currentBiz, 
       await cloudEmergencyApproveDevice(bizId, deviceId, approverLabel);
       setMsg({ type: "info", text: "Approved — this page will unlock in a moment." });
     } catch (err) {
-      setMsg({ type: "error", text: "Couldn't save approval (" + err.message + "). Most likely the businesses/{bizId}/devices Firestore rule hasn't been pasted into Firestore \u2192 Rules yet — see FIRESTORE_RULES_REFERENCE in the code." });
+      setMsg({ type: "error", text: "Couldn't save approval (" + err.message + "). Most likely the businesses/{bizId}/approved_devices Firestore rule hasn't been pasted into Firestore \u2192 Rules yet — see FIRESTORE_RULES_REFERENCE in the code." });
     } finally { setBusy(false); }
   }
 
@@ -8478,12 +8493,12 @@ function DeviceApprovalScreen({ status, deviceId, bizId, cloudUser, currentBiz, 
   return (
     <div className="min-h-screen flex items-center justify-center bg-slate-50 p-4">
       <div className="bg-white rounded-2xl shadow-lg border border-slate-200 p-8 max-w-sm w-full text-center">
-        {/* Reached only for an explicit "blocked" status now — an Admin clicked Block on this
-            device from Settings → Security elsewhere. "pending_approval" and "error" no longer
-            route here; they show a dismissible banner over the normal app instead (see the
-            deviceSyncPaused banner in App()), so cloud sync stays gated without hard-locking
-            anyone out of their own local data. The pending/errored branches below are kept as
-            defensive fallbacks in case this component is ever reached in those states. */}
+        {/* Tier 1 (Device Level Security) block screen — reached for "pending_approval", "blocked",
+            OR "error", all three treated identically as NOT approved (see the fail-closed note
+            above the call site in App()). This renders before the Login Screen even exists, so
+            `currentUser` is always null here; the emergency options below (Primary Admin Email,
+            Master PIN, Local Test Mode) are the only ways past this screen without a second
+            already-approved device. */}
         <div className={"w-14 h-14 rounded-full flex items-center justify-center mx-auto mb-4 text-2xl " + (pending || errored ? "bg-amber-100" : "bg-rose-100")}>
           {pending || errored ? "\u23F3" : "\u{1F6AB}"}
         </div>
@@ -8772,14 +8787,16 @@ function App() {
      Printer, Loyalty Program) — per-business, see Business Settings -> Features. ---- */
   const erpFeatures = useErpSettings(currentBizId);
 
-  /* ---- authentication ---- */
+  /* ---- authentication ----
+     Strict Two-Tier Authentication Architecture, Tier 2 (User Level Security): `currentUser`
+     intentionally always starts `null` on every fresh page load/reload — it is NEVER restored
+     from a previous session. Whatever was in USER_SESSION_KEY from an earlier visit is ignored
+     here on purpose; the only way `currentUser` becomes non-null is handleLogin() running after
+     someone actually submits credentials on the Login Screen. USER_SESSION_KEY itself is no
+     longer written to or read for restoring a session; handleLogout() still clears it below for
+     compatibility with any lingering value from before this change. */
   const [users, setUsers] = useState(() => loadUsers());
-  const [currentUser, setCurrentUser] = useState(() => {
-    const uid_ = loadJSON(USER_SESSION_KEY, null);
-    if (!uid_) return null;
-    const list = loadJSON(USERS_KEY, []);
-    return list.find(u => u.id === uid_) || null;
-  });
+  const [currentUser, setCurrentUser] = useState(null);
   const currentUserId = currentUser ? currentUser.id : null;
 
   /* ---- customizable display: which sidebar tabs / dashboard cards / theme / defaults this
@@ -8807,7 +8824,8 @@ function App() {
      as `can={(action) => canDo("moduleId", action)}` so the tab only needs `can("add")` etc. */
   function canDo(moduleId, action) { return can(currentUser, moduleId, action); }
   function handleLogin(u) {
-    saveJSON(USER_SESSION_KEY, u.id);
+    // Deliberately NOT persisted to USER_SESSION_KEY / localStorage — Tier 2 requires a fresh
+    // explicit login every time the app loads, so this session only ever lives in React state.
     setCurrentUser(u);
     // Jump straight to this person's chosen landing tab rather than waiting for the uiPrefs
     // effect (above) to catch up on the next render.
@@ -8825,6 +8843,10 @@ function App() {
   // check. The local role/permission session and the underlying cloud device connection are two
   // separate things; logging out of one should not tear down the other. The cloud session now only
   // ever gets disconnected by the explicit "Sign out of cloud account" action in Settings.
+  // Clears the in-memory session and returns to the User Login Screen. The device itself stays
+  // approved (Tier 1 is untouched by this) — only the Tier 2 user session ends. Also clears any
+  // leftover USER_SESSION_KEY value from before this app enforced Tier 2 on every load, so an old
+  // install upgrading to this version can't have stale data lying around.
   function handleLogout() { localStorage.removeItem(USER_SESSION_KEY); setCurrentUser(null); }
   useEffect(() => { saveJSON(USERS_KEY, users); if (CLOUD_ENABLED && cloudUser) cloudPushUsers(users); }, [users]);
   useEffect(() => {
@@ -9014,16 +9036,26 @@ function App() {
     }
   }
 
-  if (!currentUser) return <LoginScreen users={users} setUsers={setUsers} onLogin={handleLogin} onResetPassword={handleSelfResetPassword} biz={currentBiz} cloudUser={cloudUser} cloudReady={cloudReady} />;
-
-  // Full-app gate for an unapproved device — STRICT / fail-closed (see useDeviceApproval): only a
-  // confirmed "approved" status unlocks the app. "checking" (still verifying — brief spinner, not a
-  // block message), "pending_approval", "blocked", and "error" (couldn't verify at all) ALL keep the
-  // rest of the app — and therefore all Firestore business-data access, since useCloudSync above is
-  // gated on this same flag — hidden. Local login has already succeeded by this point; this is a
-  // second, device-level check on top of it. `localTestMode` is the one deliberate exception — see
-  // its declaration above; it only ever gets set true by a person explicitly clicking the Local Test
-  // Admin Mode button that appears after a real auth/unauthorized-domain failure on a local origin.
+  /* ======================================================================
+     STRICT TWO-TIER AUTHENTICATION ARCHITECTURE
+     ----------------------------------------------------------------------
+     Tier 1 — DEVICE Level Security (checked first, below): this browser/device must be a
+       confirmed "approved" entry in Firestore's approved_devices collection before anything
+       else renders. "checking" (still verifying), "pending_approval", "blocked", and "error"
+       (couldn't verify at all) are ALL treated as NOT approved — fail-closed, no exceptions —
+       and produce a full-screen block. Nobody sees the Login Screen, let alone the Dashboard,
+       on an unapproved device, no matter who they are or what credentials they'd type.
+     Tier 2 — USER Level Security (checked after Tier 1 passes, further below): even on an
+       approved device, the app NEVER auto-restores a previous session. Every fresh page load
+       lands on the formal Login Screen and requires an explicit username/password (or Google
+       sign-in) before the Dashboard renders. See handleLogin/handleLogout and the currentUser
+       state initializer above — there is no session auto-bypass by design.
+     `localTestMode` remains the one deliberate escape hatch for Tier 1, exactly as before — it
+     only ever gets set true by someone explicitly clicking "Enable Local Test Admin Mode" after
+     a real auth/unauthorized-domain failure on a local (file://\/localhost) origin, for UI
+     testing only. Even with Tier 1 bypassed this way, Tier 2 (the Login Screen) still always
+     applies — Local Test Mode never skips the login step.
+     ====================================================================== */
   if (CLOUD_ENABLED && !localTestMode && deviceApproval.status === "checking") {
     if (checkingTooLong) {
       const unauthorizedDomain = cloudAuthErrorCode === "auth/unauthorized-domain";
@@ -9054,7 +9086,6 @@ function App() {
             )}
             <div className="flex gap-2 justify-center">
               <button onClick={() => window.location.reload()} className="text-sm px-4 py-2 rounded-lg bg-[var(--accent-600)] text-white hover:bg-[var(--accent-700)]">Retry</button>
-              <button onClick={handleLogout} className="text-sm px-4 py-2 rounded-lg border border-slate-300 text-slate-600 hover:bg-slate-50">Log Out</button>
             </div>
           </div>
         </div>
@@ -9066,20 +9097,26 @@ function App() {
       </div>
     );
   }
-  // Only an explicit Admin "Block" action ever produces a hard, full-app lockout. Every other
-  // non-approved state (pending_approval, error, or any future status this app doesn't recognize)
-  // falls through to the normal app below with a dismissible banner instead — cloud sync itself is
-  // still strictly gated to "approved" only via `deviceIsApproved` passed into useCloudSync above,
-  // so an unapproved/errored device can never read or write shared cloud data either way. This
-  // split exists so that a broken/misconfigured Firebase project (e.g. Firestore rules not yet
-  // published on a freshly swapped-in project, or the "Anonymous" provider not enabled) can never
-  // lock someone out of their own local data — it can only ever pause cloud sync until fixed. A
-  // device an Admin has actually clicked "Block" on is the one case that should still hard-stop.
-  if (CLOUD_ENABLED && !localTestMode && deviceApproval.status === "blocked") {
+  // Tier 1 enforcement: ANY non-"approved" status (pending_approval, blocked, or error — couldn't
+  // verify at all) blocks access completely with the "Device Awaiting Admin Approval" screen. This
+  // is a deliberate fail-closed choice: a device this app cannot positively confirm as approved is
+  // treated the same as one that's explicitly blocked, on the theory that "we couldn't verify" and
+  // "not allowed" should look identical to someone trying to get in. The trade-off is that a
+  // broken/misconfigured Firebase project (unpublished Firestore rules, Anonymous auth disabled,
+  // etc.) will also show this screen — that's why the emergency self-approve options inside
+  // DeviceApprovalScreen (Primary Admin Email shortcut, Emergency Master PIN) and Local Test Mode
+  // below all remain available as escape hatches; see the note above FIREBASE_CONFIG for the setup
+  // checklist that prevents this from happening on a freshly swapped-in project.
+  if (CLOUD_ENABLED && !localTestMode && deviceApproval.status !== "approved") {
     return <DeviceApprovalScreen status={deviceApproval.status} deviceId={deviceApproval.deviceId} bizId={currentBizId} cloudUser={cloudUser} currentBiz={currentBiz} currentUser={currentUser} onLogout={handleLogout} bizName={currentBiz.name}
       isLocalEnv={IS_LOCAL_ENV} cloudAuthErrorCode={cloudAuthErrorCode} onEnableLocalTestMode={() => setLocalTestMode(true)} />;
   }
-  const deviceSyncPaused = CLOUD_ENABLED && !localTestMode && deviceApproval.status !== "approved";
+
+  // Tier 2 enforcement: device is approved (or Local Test Mode is bypassing Tier 1 for UI testing)
+  // — but that never auto-admits anyone into the Dashboard. The explicit User Login Screen is
+  // always shown until real credentials are entered; see the currentUser state initializer above,
+  // which intentionally does NOT restore a previous session automatically.
+  if (!currentUser) return <LoginScreen users={users} setUsers={setUsers} onLogin={handleLogin} onResetPassword={handleSelfResetPassword} biz={currentBiz} cloudUser={cloudUser} cloudReady={cloudReady} />;
 
   const compact = !!uiPrefs.compactSidebar;
   return (
@@ -9089,14 +9126,7 @@ function App() {
         {"\u26A0\uFE0F"} Environment: Local Test Mode — device approval bypassed, not connected to real cloud data
       </div>
     )}
-    {!localTestMode && deviceSyncPaused && (
-      <div className="fixed top-0 left-0 right-0 z-50 bg-sky-600 text-white text-[11px] font-medium text-center py-1 px-2">
-        {"\u2601\uFE0F"} Cloud sync paused on this device
-        {deviceApproval.status === "pending_approval" ? " — waiting for an Admin to approve it (Settings → Security)." : deviceApproval.status === "checking" ? " — checking access…" : " — couldn't verify device access (check Firestore rules/setup)."}
-        {" "}You're working locally in the meantime; nothing here is lost.
-      </div>
-    )}
-    <div className={"min-h-screen flex " + ((localTestMode || deviceSyncPaused) ? "pt-5 " : "") + (uiPrefs.hideUrdu ? "hide-urdu " : "") + (effectiveCustomTextColor(uiPrefs) ? "custom-text-color " : "") + (uiPrefs.boldText ? "bold-text " : "") + (uiPrefs.darkMode ? "dark-mode" : "")}>
+    <div className={"min-h-screen flex " + (localTestMode ? "pt-5 " : "") + (uiPrefs.hideUrdu ? "hide-urdu " : "") + (effectiveCustomTextColor(uiPrefs) ? "custom-text-color " : "") + (uiPrefs.boldText ? "bold-text " : "") + (uiPrefs.darkMode ? "dark-mode" : "")}>
       <div className={"fixed md:static z-40 md:z-0 top-0 left-0 h-full app-sidebar text-slate-200 flex flex-col transition-all " + (compact ? "w-20" : "w-64") + " " + (sidebarOpen ? "translate-x-0" : "-translate-x-full md:translate-x-0")}>
         <div className={"px-5 py-4 border-b border-slate-700 flex items-center gap-3 " + (compact ? "justify-center px-2" : "")}>
           <div className="w-10 h-10 rounded-full bg-white text-[var(--accent-700)] flex items-center justify-center font-bold text-sm flex-shrink-0 overflow-hidden">
