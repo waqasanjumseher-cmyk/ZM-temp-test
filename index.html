@@ -5327,7 +5327,7 @@ function CustomersTab({ data, setData, role, biz, currentUserName, erpSettings, 
     let rows = data.customers.filter(c => !q || [c.name, c.phone, c.cnic].some(v => (v || "").toLowerCase().includes(q)));
     const withLedger = rows.map(c => ({ ...c, __outstanding: customerLedgerSummary(data, c.id).totalOutstanding }));
     const statusFiltered = statusFilter === "all" ? withLedger : withLedger.filter(c => statusFilter === "outstanding" ? c.__outstanding > 0 : c.__outstanding <= 0);
-    return sortRows(statusFiltered, sort, { name: c => c.name || "", outstanding: c => c.__outstanding });
+    return sortRows(statusFiltered, sort, { name: c => c.name || "", outstanding: c => c.__outstanding, activity: c => c.lastActivity || "" });
   }, [data.customers, data.sales, query, statusFilter, sort]);
   const { page, pageSize, setPage, pageRows: pagedCustomers, changePageSize } = usePagedRows(filtered, 25);
 
@@ -5389,7 +5389,7 @@ function CustomersTab({ data, setData, role, biz, currentUserName, erpSettings, 
         search={query} onSearch={setQuery} searchPlaceholder="Search name, phone, CNIC..."
         statusOptions={[{ value: "all", label: "All Customers" }, { value: "outstanding", label: "Has Outstanding Balance" }, { value: "settled", label: "Fully Settled" }]}
         status={statusFilter} onStatus={setStatusFilter}
-        sortOptions={[{ value: "name:asc", label: "Name: A-Z" }, { value: "name:desc", label: "Name: Z-A" }, { value: "outstanding:desc", label: "Outstanding: High to Low" }, { value: "outstanding:asc", label: "Outstanding: Low to High" }]}
+        sortOptions={[{ value: "name:asc", label: "Name: A-Z" }, { value: "name:desc", label: "Name: Z-A" }, { value: "outstanding:desc", label: "Outstanding: High to Low" }, { value: "outstanding:asc", label: "Outstanding: Low to High" }, { value: "activity:asc", label: "Activity: Oldest First" }, { value: "activity:desc", label: "Activity: Newest First" }]}
         sort={sort} onSort={setSort}
       />
       <div className="bg-white rounded-xl border border-slate-200 overflow-x-auto">
@@ -8415,7 +8415,7 @@ function ForgotPasswordPanel({ users, onResetPassword, onBack }) {
   );
 }
 
-function DeviceApprovalScreen({ status, deviceId, bizId, cloudUser, currentBiz, currentUser, onLogout, bizName }) {
+function DeviceApprovalScreen({ status, deviceId, bizId, cloudUser, currentBiz, currentUser, onLogout, bizName, isLocalEnv, cloudAuthErrorCode, onEnableLocalTestMode }) {
   const pending = status === "pending_approval";
   const errored = status === "error";
   const [busy, setBusy] = useState(false);
@@ -8496,6 +8496,17 @@ function DeviceApprovalScreen({ status, deviceId, bizId, cloudUser, currentBiz, 
                 </button>
               </div>
             )}
+          </div>
+        )}
+
+        {isLocalEnv && onEnableLocalTestMode && (
+          <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-3 text-left">
+            <p className="text-xs text-amber-800 mb-2">
+              Running from a local/file/localhost origin{cloudAuthErrorCode === "auth/unauthorized-domain" ? " (Firebase rejected it: auth/unauthorized-domain)" : ""} — for local UI testing only (never for real shop data), you can bypass this check on this device for the rest of this session.
+            </p>
+            <button onClick={onEnableLocalTestMode} className="w-full text-xs font-medium px-3 py-2 rounded-lg bg-amber-600 hover:bg-amber-700 text-white">
+              Enable Local Test Admin Mode
+            </button>
           </div>
         )}
 
@@ -8980,9 +8991,12 @@ function App() {
   // block message), "pending_approval", "blocked", and "error" (couldn't verify at all) ALL keep the
   // rest of the app — and therefore all Firestore business-data access, since useCloudSync above is
   // gated on this same flag — hidden. Local login has already succeeded by this point; this is a
-  // second, device-level check on top of it.
-  if (CLOUD_ENABLED && deviceApproval.status === "checking") {
+  // second, device-level check on top of it. `localTestMode` is the one deliberate exception — see
+  // its declaration above; it only ever gets set true by a person explicitly clicking the Local Test
+  // Admin Mode button that appears after a real auth/unauthorized-domain failure on a local origin.
+  if (CLOUD_ENABLED && !localTestMode && deviceApproval.status === "checking") {
     if (checkingTooLong) {
+      const unauthorizedDomain = cloudAuthErrorCode === "auth/unauthorized-domain";
       return (
         <div className="min-h-screen flex items-center justify-center bg-slate-50 p-4">
           <div className="bg-white rounded-2xl shadow-lg border border-slate-200 p-8 max-w-sm w-full text-center">
@@ -8994,6 +9008,20 @@ function App() {
               {" "}<code className="bg-slate-100 px-1 rounded">file://</code> in the address bar) instead of the actual hosted
               website address — open the real <code className="bg-slate-100 px-1 rounded">https://</code> link instead. Otherwise, check your internet connection.
             </p>
+            {IS_LOCAL_ENV && (
+              <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-4 text-left">
+                <p className="text-xs text-amber-800 mb-2">
+                  {unauthorizedDomain
+                    ? "Confirmed: Firebase rejected this local origin (auth/unauthorized-domain) — that's expected for file:// or localhost, since it's not on the project's Authorized Domains list."
+                    : "You're running from a local/file/localhost origin, where Firebase Auth often can't complete at all."}
+                  {" "}For local UI testing only (never for real shop data), you can bypass this check on this device for the rest of this session.
+                </p>
+                <button onClick={() => setLocalTestMode(true)}
+                  className="w-full text-xs font-medium px-3 py-2 rounded-lg bg-amber-600 hover:bg-amber-700 text-white">
+                  Enable Local Test Admin Mode
+                </button>
+              </div>
+            )}
             <div className="flex gap-2 justify-center">
               <button onClick={() => window.location.reload()} className="text-sm px-4 py-2 rounded-lg bg-[var(--accent-600)] text-white hover:bg-[var(--accent-700)]">Retry</button>
               <button onClick={handleLogout} className="text-sm px-4 py-2 rounded-lg border border-slate-300 text-slate-600 hover:bg-slate-50">Log Out</button>
@@ -9008,13 +9036,20 @@ function App() {
       </div>
     );
   }
-  if (CLOUD_ENABLED && deviceApproval.status !== "approved") {
-    return <DeviceApprovalScreen status={deviceApproval.status} deviceId={deviceApproval.deviceId} bizId={currentBizId} cloudUser={cloudUser} currentBiz={currentBiz} currentUser={currentUser} onLogout={handleLogout} bizName={currentBiz.name} />;
+  if (CLOUD_ENABLED && !localTestMode && deviceApproval.status !== "approved") {
+    return <DeviceApprovalScreen status={deviceApproval.status} deviceId={deviceApproval.deviceId} bizId={currentBizId} cloudUser={cloudUser} currentBiz={currentBiz} currentUser={currentUser} onLogout={handleLogout} bizName={currentBiz.name}
+      isLocalEnv={IS_LOCAL_ENV} cloudAuthErrorCode={cloudAuthErrorCode} onEnableLocalTestMode={() => setLocalTestMode(true)} />;
   }
 
   const compact = !!uiPrefs.compactSidebar;
   return (
-    <div className={"min-h-screen flex " + (uiPrefs.hideUrdu ? "hide-urdu " : "") + (effectiveCustomTextColor(uiPrefs) ? "custom-text-color " : "") + (uiPrefs.boldText ? "bold-text " : "") + (uiPrefs.darkMode ? "dark-mode" : "")}>
+    <>
+    {localTestMode && (
+      <div className="fixed top-0 left-0 right-0 z-50 bg-amber-500 text-white text-[11px] font-medium text-center py-0.5">
+        {"\u26A0\uFE0F"} Environment: Local Test Mode — device approval bypassed, not connected to real cloud data
+      </div>
+    )}
+    <div className={"min-h-screen flex " + (localTestMode ? "pt-5 " : "") + (uiPrefs.hideUrdu ? "hide-urdu " : "") + (effectiveCustomTextColor(uiPrefs) ? "custom-text-color " : "") + (uiPrefs.boldText ? "bold-text " : "") + (uiPrefs.darkMode ? "dark-mode" : "")}>
       <div className={"fixed md:static z-40 md:z-0 top-0 left-0 h-full app-sidebar text-slate-200 flex flex-col transition-all " + (compact ? "w-20" : "w-64") + " " + (sidebarOpen ? "translate-x-0" : "-translate-x-full md:translate-x-0")}>
         <div className={"px-5 py-4 border-b border-slate-700 flex items-center gap-3 " + (compact ? "justify-center px-2" : "")}>
           <div className="w-10 h-10 rounded-full bg-white text-[var(--accent-700)] flex items-center justify-center font-bold text-sm flex-shrink-0 overflow-hidden">
@@ -9067,6 +9102,7 @@ function App() {
         <main className="flex-1 p-4 md:p-6 overflow-y-auto">{renderTab()}</main>
       </div>
     </div>
+    </>
   );
 }
 
