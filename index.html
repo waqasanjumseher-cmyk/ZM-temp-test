@@ -993,6 +993,96 @@ function exportReportPDF(biz, title, columns, rows, filename, totals, netOutstan
   }
   doc.save(filename + ".pdf");
 }
+/* ---- Partnership Profit-Sharing Report (period-based) ----
+   One PDF covering a chosen date range: overall business P&L for that period (sales, COGS, gross
+   profit, expenses, salaries, net profit), an expense-category breakdown so "kitna kharcha kis
+   madd mein hua" is visible, and — the main deliverable — a per-partner table showing each
+   partner's % share, their allocated profit for that period, drawings taken during that same
+   period, and their net share after drawings. Reuses rangeFinancials() (already period-aware) for
+   the top summary so this always matches what Reports/Dashboard show for the same range. Partner
+   drawings are filtered by date here (unlike partnerBalance(), which is lifetime/all-time) since
+   this report is specifically about one period. */
+function buildPartnershipPeriodReport(data, from, to) {
+  const rf = rangeFinancials(data, from, to);
+  const expensesInRangeList = (data.expenses || []).filter(e => inRange(e.date, from, to));
+  const expenseByCategory = {};
+  expensesInRangeList.forEach(e => { const cat = e.category || "Other"; expenseByCategory[cat] = (expenseByCategory[cat] || 0) + (Number(e.amount) || 0); });
+  const partnerRows = (data.partners || []).map(p => {
+    const percent = Number(p.percent) || 0;
+    const allocatedProfit = rf.netProfit * percent / 100;
+    const drawingsInRange = (data.partnerTransactions || [])
+      .filter(t => t.partnerId === p.id && t.type === "drawing" && inRange(t.date, from, to))
+      .reduce((s, t) => s + (Number(t.amount) || 0), 0);
+    return { name: p.name, percent, allocatedProfit, drawingsInRange, netForPeriod: allocatedProfit - drawingsInRange };
+  });
+  return { rf, expenseByCategory, partnerRows };
+}
+function generatePartnershipReportPDF(biz, data, from, to) {
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit: "pt" });
+  const { rf, expenseByCategory, partnerRows } = buildPartnershipPeriodReport(data, from, to);
+  const pageW = doc.internal.pageSize.getWidth();
+  const marginL = 40, marginR = 40;
+
+  doc.setFontSize(14); drawUrduSafeText(doc, biz.header || biz.name || "Shop ERP", marginL, 40, 14, [0, 0, 0]);
+  doc.setFontSize(10); doc.setTextColor(100);
+  drawUrduSafeText(doc, [biz.address, biz.phone].filter(Boolean).join("  |  "), marginL, 56, 10, [100, 100, 100]);
+  doc.setFontSize(12); doc.setTextColor(30);
+  doc.text("Partnership Profit-Sharing Report", marginL, 78);
+  doc.setFontSize(9); doc.setTextColor(120);
+  doc.text("Period: " + (from ? fmtDate(from) : "Start") + "  to  " + (to ? fmtDate(to) : "Today") + "   |   Generated: " + new Date().toLocaleString(), marginL, 92);
+
+  // Section 1: overall business P&L for the period, so the reader can see exactly how the
+  // allocated profit below was derived (sales -> COGS -> gross profit -> minus expenses/salaries).
+  doc.autoTable({
+    startY: 106,
+    head: [["Sales (Rs)", "COGS (Rs)", "Gross Profit (Rs)", "Expenses (Rs)", "Salaries (Rs)", "Net Profit (Rs)"]],
+    body: [[fmtMoney(rf.revenue), fmtMoney(rf.cogs), fmtMoney(rf.revenue - rf.cogs), fmtMoney(rf.expensesInRange), fmtMoney(rf.salariesInRange), fmtMoney(rf.netProfit)]],
+    styles: { fontSize: 8.5, cellPadding: 5, halign: "right" },
+    headStyles: { fillColor: [79, 70, 229], halign: "right" },
+    margin: { left: marginL, right: marginR },
+  });
+
+  // Section 2: expense breakdown by category, so "kitna kharcha kis cheez pe hua" is visible —
+  // skipped entirely if there were no expenses in this period.
+  let nextY = (doc.lastAutoTable && doc.lastAutoTable.finalY ? doc.lastAutoTable.finalY : 106) + 18;
+  const catRows = Object.keys(expenseByCategory).sort((a, b) => expenseByCategory[b] - expenseByCategory[a]).map(cat => [cat, fmtMoney(expenseByCategory[cat])]);
+  if (catRows.length) {
+    doc.setFontSize(10); doc.setTextColor(30);
+    doc.text("Expense Breakdown (by category)", marginL, nextY);
+    doc.autoTable(withUrduSafeCells({
+      startY: nextY + 8,
+      head: [["Category", "Amount (Rs)"]],
+      body: catRows,
+      foot: [["TOTAL", fmtMoney(rf.expensesInRange)]],
+      styles: { fontSize: 8.5, cellPadding: 4 },
+      headStyles: { fillColor: [100, 116, 139] },
+      footStyles: { fillColor: [241, 245, 249], textColor: 20, fontStyle: "bold" },
+      columnStyles: { 1: { halign: "right" } },
+      margin: { left: marginL, right: marginR },
+    }));
+    nextY = (doc.lastAutoTable && doc.lastAutoTable.finalY ? doc.lastAutoTable.finalY : nextY) + 18;
+  }
+
+  // Section 3: the main deliverable — each partner's profit share for this specific period, minus
+  // whatever they drew out during the same period, so "kis partner ka kitna munafa banta hai" is
+  // answered directly per period, not as a lifetime running balance.
+  doc.setFontSize(10); doc.setTextColor(30);
+  doc.text("Partner-wise Profit Sharing (this period)", marginL, nextY);
+  doc.autoTable(withUrduSafeCells({
+    startY: nextY + 8,
+    head: [["Partner", "Share %", "Allocated Profit (Rs)", "Drawings this period (Rs)", "Net Share (Rs)"]],
+    body: partnerRows.length ? partnerRows.map(p => [p.name, p.percent + "%", fmtMoney(p.allocatedProfit), fmtMoney(p.drawingsInRange), fmtMoney(p.netForPeriod)]) : [["No partners added yet", "-", "-", "-", "-"]],
+    foot: partnerRows.length ? [["TOTAL", partnerRows.reduce((s, p) => s + p.percent, 0) + "%", fmtMoney(partnerRows.reduce((s, p) => s + p.allocatedProfit, 0)), fmtMoney(partnerRows.reduce((s, p) => s + p.drawingsInRange, 0)), fmtMoney(partnerRows.reduce((s, p) => s + p.netForPeriod, 0))]] : undefined,
+    styles: { fontSize: 8.5, cellPadding: 5 },
+    headStyles: { fillColor: [79, 70, 229] },
+    footStyles: { fillColor: [241, 245, 249], textColor: 20, fontStyle: "bold" },
+    columnStyles: { 1: { halign: "right" }, 2: { halign: "right" }, 3: { halign: "right" }, 4: { halign: "right" } },
+    margin: { left: marginL, right: marginR },
+  }));
+
+  doc.save("Partnership_Report_" + (from || "start") + "_to_" + (to || "today") + ".pdf");
+}
 /* ---- Report row builders: each returns { columns, rows, totals? } ready for either exporter ---- */
 function buildCustomerLedgerReport(data) {
   const columns = [
@@ -1108,17 +1198,6 @@ function normalizeData(d) {
 /* Sample stock shown the first time the app runs on a fresh browser, so the shop isn't empty.
    Includes one serialized phone (unique IMEI) and a bulk accessory (3 identical units, one row
    each) to demonstrate the serialized-vs-bulk quantity behaviour in the Sales/POS form. */
-function sampleInventory() {
-  const today = todayISO();
-  const base = { imei2: "", serialNumber: "", specs: "", ram: "", storage: "", color: "", dealerId: "", conditionPhoto: "", accessories: { box: true, charger: true, cable: true, warranty: false } };
-  return [
-    { ...base, id: uid("item"), itemName: "iPhone 13", brand: "Apple", model: "A2633", category: "Mobile", imei1: "356789101234567", ram: "4GB", storage: "128GB", color: "Midnight", condition: "Used", purchasePrice: 145000, retailPrice: 165000, minPrice: 155000, status: "Available", dateAdded: today },
-    { ...base, id: uid("item"), itemName: "Samsung Galaxy A54", brand: "Samsung", model: "SM-A546", category: "Mobile", imei1: "356789101234599", ram: "8GB", storage: "128GB", color: "Awesome Graphite", condition: "New", purchasePrice: 68000, retailPrice: 78000, minPrice: 74000, status: "Available", dateAdded: today },
-    { ...base, id: uid("item"), itemName: "USB-C Fast Charger 20W", brand: "Generic", model: "", category: "Accessory", color: "White", condition: "New", accessories: { box: false, charger: false, cable: false, warranty: false }, purchasePrice: 800, retailPrice: 1500, minPrice: 1200, status: "Available", dateAdded: today },
-    { ...base, id: uid("item"), itemName: "USB-C Fast Charger 20W", brand: "Generic", model: "", category: "Accessory", color: "White", condition: "New", accessories: { box: false, charger: false, cable: false, warranty: false }, purchasePrice: 800, retailPrice: 1500, minPrice: 1200, status: "Available", dateAdded: today },
-    { ...base, id: uid("item"), itemName: "USB-C Fast Charger 20W", brand: "Generic", model: "", category: "Accessory", color: "White", condition: "New", accessories: { box: false, charger: false, cable: false, warranty: false }, purchasePrice: 800, retailPrice: 1500, minPrice: 1200, status: "Available", dateAdded: today },
-  ];
-}
 const DATA_KEY = (bizId) => "erp_data_" + bizId;
 /* Auto-Backup: a redundant, timestamped JSON snapshot kept alongside the live DATA_KEY record.
    DATA_KEY is already the app's real-time source of truth (saved on every `data` change — see the
@@ -1209,19 +1288,14 @@ function loadFirebaseOverride() { return loadJSON(FIREBASE_OVERRIDE_KEY, null); 
 function saveFirebaseOverride(v) { saveJSON(FIREBASE_OVERRIDE_KEY, v); }
 function clearFirebaseOverride() { localStorage.removeItem(FIREBASE_OVERRIDE_KEY); }
 const FB_OVERRIDE = loadFirebaseOverride();
-const FB_SYNC_DISABLED_BY_USER = !!(FB_OVERRIDE && FB_OVERRIDE.enabled === false);
-const FB_USING_CUSTOM_CONFIG = !!(FB_OVERRIDE && FB_OVERRIDE.enabled !== false && FB_OVERRIDE.config && FB_OVERRIDE.config.apiKey && FB_OVERRIDE.config.projectId);
+// Offline/local-only operation has been removed entirely: cloud sync can no longer be turned off
+// from Settings (see FirebaseSettingsPanel below, which now only lets an Admin point at a custom
+// Firebase project — never disable sync). CLOUD_ENABLED is therefore only ever false if the
+// Firebase SDK itself failed to load or the active config is genuinely incomplete, never by choice.
+const FB_USING_CUSTOM_CONFIG = !!(FB_OVERRIDE && FB_OVERRIDE.config && FB_OVERRIDE.config.apiKey && FB_OVERRIDE.config.projectId);
 const EFFECTIVE_FIREBASE_CONFIG = FB_USING_CUSTOM_CONFIG ? FB_OVERRIDE.config : FIREBASE_CONFIG;
-const CLOUD_ENABLED = !FB_SYNC_DISABLED_BY_USER && !!(EFFECTIVE_FIREBASE_CONFIG.apiKey && EFFECTIVE_FIREBASE_CONFIG.projectId && window.firebase);
+const CLOUD_ENABLED = !!(EFFECTIVE_FIREBASE_CONFIG.apiKey && EFFECTIVE_FIREBASE_CONFIG.projectId && window.firebase);
 let fbApp = null, fbAuth = null, fbDb = null, fbStorage = null, fbPersistenceOK = false;
-/* Local Testing / Dev Mode detection — a locally-opened copy (file://) or a localhost dev server
-   almost never has its origin in Firebase's "Authorized domains" list, so Auth calls like
-   signInAnonymously() fail there with auth/unauthorized-domain even though the Firebase project
-   itself is configured correctly. This flag is used ONLY to decide whether to offer a "Local Test
-   Admin Mode" escape hatch when that specific error happens (see the auth effect and
-   LocalTestModeBadge in App()) — it never bypasses anything by itself. */
-const IS_LOCAL_ENV = window.location.protocol === "file:" || window.location.protocol === "content:" ||
-  window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1";
 
 /* ============================ EMAILJS (Forgot Password OTP) ============================
    A static single-file app has no server, so it can't send email itself — the browser has no
@@ -1667,6 +1741,41 @@ const EMERGENCY_ACCESS_PASSWORD_HASH = "b6c1938590ed6324c25706378e64e2a3cdfc9f11
 const EMERGENCY_ACCESS_KEY = "erp_emergency_device_access";
 function loadEmergencyAccessGrants() { return loadJSON(EMERGENCY_ACCESS_KEY, {}); }
 function hasEmergencyAccessGrant(bizId) { return !!loadEmergencyAccessGrants()[bizId]; }
+/* ---- Master Developer Code (full bypass: Tier 1 device approval AND Tier 2 user login) ----
+   Stronger than the Emergency Master Password above: that one only clears the DEVICE gate and
+   still drops the person on the normal username/password Login Screen (Tier 2). This one clears
+   BOTH — entering it correctly on the blocked-device screen approves the device (same as the
+   Emergency Password, including a best-effort Firestore write so other Admins see it registered)
+   AND immediately signs the person in as this business's Admin, skipping the Login Screen
+   entirely. Intended for the app's own developer/owner only — treat this code exactly like the
+   master key to the whole shop's data: anyone who has it gets full Admin access from any device,
+   with no approval step and no password prompt, ever. Never share it the way you might share a
+   regular login.
+   Only a SHA-256 hash is stored here, never the plain code. To change it: open this file in a
+   browser, DevTools Console, run `await sha256Hex("your-new-code")` (sha256Hex defined above),
+   paste the resulting hex string in below, then reload. */
+const MASTER_DEV_CODE_HASH = "aeece52420ac5684c16cf3a4a8894bd95e9b61a7c1ec2c070d3528e7ec4365f5";
+const MASTER_BYPASS_KEY = "erp_master_dev_bypass";
+function loadMasterBypassGrants() { return loadJSON(MASTER_BYPASS_KEY, {}); }
+function hasMasterBypassGrant(bizId) { return !!loadMasterBypassGrants()[bizId]; }
+/* Verifies the entered code against MASTER_DEV_CODE_HASH. On success: (1) grants this device
+   permanent local bypass of BOTH tiers for this business (localStorage — survives reloads, works
+   offline, needs no Firestore access to take effect), and (2) makes a best-effort attempt to also
+   register the device as "approved" in Firestore so it shows correctly in Settings -> Security and
+   cloud sync starts working — fire-and-forget, its failure does not affect whether bypass is
+   granted. Tier 2 (the actual auto-login as Admin) is completed by the caller in App(), which reads
+   hasMasterBypassGrant() and picks the Admin user itself once `users` is loaded. */
+async function tryMasterDevCode(code, bizId, deviceId, cloudUser) {
+  const entered = await sha256Hex((code || "").trim());
+  if (entered !== MASTER_DEV_CODE_HASH) return false;
+  const grants = loadMasterBypassGrants();
+  grants[bizId] = { grantedAt: new Date().toISOString(), deviceId };
+  saveJSON(MASTER_BYPASS_KEY, grants);
+  if (CLOUD_ENABLED && fbDb && cloudUser && bizId && deviceId) {
+    cloudEmergencyApproveDevice(bizId, deviceId, "Master developer code").catch(() => {});
+  }
+  return true;
+}
 /* Verifies the entered password against EMERGENCY_ACCESS_PASSWORD_HASH. On success: (1) grants
    this device local, offline-proof access to this business immediately by writing to localStorage
    (this is what actually unblocks the UI — see the `emergencyAccess` check in App()), and (2) makes
@@ -3788,7 +3897,7 @@ function InventoryTab({ data, setData, role, dealers, biz, erpSettings, can, uiP
           </thead>
           <tbody>
             {pagedInventory.map((i, idx) => (
-              <tr key={i.id} className={"border-t-2 border-slate-300 hover:bg-slate-50" + (zebraOn && idx % 2 === 1 ? " bg-slate-50" : " bg-white")}>
+              <tr key={i.id} className={"border-t-2 border-slate-300 hover:bg-slate-50" + (zebraOn && idx % 2 === 1 ? " bg-[#f0fdff]" : " bg-white")}>
                 <td className="px-3 py-2"><div className="font-medium text-slate-800">{i.itemName}</div><div className="text-xs text-slate-400">{i.brand} {i.model}</div></td>
                 <td className="px-3 py-2">{i.category}</td>
                 <td className="px-3 py-2 font-mono text-xs">{i.imei1 || "-"}</td>
@@ -3971,7 +4080,7 @@ function DealersTab({ data, setData, role, can, uiPrefs }) {
               const isOpen = expandedDealerId === d.id;
               return (
                 <React.Fragment key={d.id}>
-                  <tr className={"border-t-2 border-slate-300 hover:bg-slate-50 cursor-pointer" + (isOpen ? " bg-slate-50" : (zebraOn && idx % 2 === 1 ? " bg-slate-50" : " bg-white"))} onClick={() => toggleExpand(d.id)}>
+                  <tr className={"border-t-2 border-slate-300 hover:bg-slate-50 cursor-pointer" + (isOpen ? " bg-slate-50" : (zebraOn && idx % 2 === 1 ? " bg-[#f0fdff]" : " bg-white"))} onClick={() => toggleExpand(d.id)}>
                     <td className="px-3 py-2 text-slate-400">
                       <span className={"inline-block transition-transform duration-150" + (isOpen ? " rotate-90" : "")}>&#9656;</span>
                     </td>
@@ -4205,7 +4314,7 @@ function PurchasesTab({ data, setData, role, biz, erpSettings, can, uiPrefs }) {
               const paid = (Number(p.cashPaid) || 0) + (Number(p.onlinePaid) || 0);
               const rem = (Number(p.totalAmount) || 0) - paid;
               return (
-                <tr key={p.id} className={"border-t-2 border-slate-300 hover:bg-slate-50" + (zebraOn && idx % 2 === 1 ? " bg-slate-50" : " bg-white")}>
+                <tr key={p.id} className={"border-t-2 border-slate-300 hover:bg-slate-50" + (zebraOn && idx % 2 === 1 ? " bg-[#f0fdff]" : " bg-white")}>
                   <td className="px-3 py-2">{fmtDate(p.date)}</td><td className="px-3 py-2">{data.dealers.find(d => d.id === p.dealerId)?.name || "-"}</td><td className="px-3 py-2">{p.invoiceNumber}</td>
                   <td className="px-3 py-2">{fmtMoney(p.totalAmount)}</td><td className="px-3 py-2">{fmtMoney(paid)}</td>
                   <td className={"px-3 py-2 font-medium " + (rem > 0 ? "text-rose-600" : "text-emerald-600")}>{fmtMoney(rem)}</td>
@@ -5471,7 +5580,7 @@ function CustomersTab({ data, setData, role, biz, currentUserName, erpSettings, 
           </tr></thead>
           <tbody>
             {pagedCustomers.map((c, idx) => (
-              <tr key={c.id} className={"border-t-2 border-slate-300 hover:bg-slate-50" + (zebraOn && idx % 2 === 1 ? " bg-slate-50" : " bg-white")}>
+              <tr key={c.id} className={"border-t-2 border-slate-300 hover:bg-slate-50" + (zebraOn && idx % 2 === 1 ? " bg-[#f0fdff]" : " bg-white")}>
                 <td className="px-3 py-2 font-medium text-slate-800 max-w-[140px] sm:max-w-none whitespace-normal break-words align-top">
                   <span className={containsUrdu(c.name) ? "urdu" : ""}>{c.name}</span>
                 </td>
@@ -5720,7 +5829,7 @@ function RecoveryTab({ data, setData, biz, currentUserName, can, uiPrefs }) {
               const badge = s.statusTag === "overdue" ? { text: "Overdue", cls: "bg-rose-100 text-rose-700" } : s.statusTag === "dueSoon" ? { text: "Due Soon", cls: "bg-amber-100 text-amber-700" } : { text: "On Track", cls: "bg-emerald-100 text-emerald-700" };
               return (
                 <React.Fragment key={s.id}>
-                  <tr className={"border-t-2 border-slate-300 hover:bg-slate-50 cursor-pointer" + (zebraOn && idx % 2 === 1 ? " bg-slate-50" : " bg-white")} onClick={() => setExpanded(expanded === s.id ? null : s.id)}>
+                  <tr className={"border-t-2 border-slate-300 hover:bg-slate-50 cursor-pointer" + (zebraOn && idx % 2 === 1 ? " bg-[#f0fdff]" : " bg-white")} onClick={() => setExpanded(expanded === s.id ? null : s.id)}>
                     <td className="px-3 py-2">{s.customerName || "-"} <div className="text-xs text-slate-400">{s.customerPhone}</div></td>
                     <td className="px-3 py-2">{saleItemsLabel(s, data)}</td>
                     <td className="px-3 py-2">{fmtMoney(s.salePrice)}</td>
@@ -6575,7 +6684,7 @@ function DayEndCashSection({ data, setData, canAdd, canDelete, currentUserName }
 
 /* ============================ PARTNERS TAB ============================ */
 function blankPartner() { return { name: "", phone: "", investment: "", percent: "" }; }
-function PartnersTab({ data, setData, can }) {
+function PartnersTab({ data, setData, can, biz }) {
   const canAdd = can("add"), canEdit = can("edit"), canDelete = can("delete");
   const [showForm, setShowForm] = useState(false);
   const [editing, setEditing] = useState(null);
@@ -6587,6 +6696,8 @@ function PartnersTab({ data, setData, can }) {
   const [drawAccount, setDrawAccount] = useState((data.accounts[0] && data.accounts[0].id) || "");
   const [drawItemId, setDrawItemId] = useState("");
   const [drawNote, setDrawNote] = useState("");
+  const [reportFrom, setReportFrom] = useState(presetRange("month").from);
+  const [reportTo, setReportTo] = useState(presetRange("month").to);
 
   const pl = useMemo(() => calcProfitLoss(data), [data]);
   const totalPercent = data.partners.reduce((s, p) => s + (Number(p.percent) || 0), 0);
@@ -6614,6 +6725,7 @@ function PartnersTab({ data, setData, can }) {
     const it = data.inventory.find(i => i.id === id);
     if (it) setDrawAmount(String(it.purchasePrice || 0));
   }
+  function generateReport() { generatePartnershipReportPDF(biz || {}, data, reportFrom, reportTo); }
 
   return (
     <div>
@@ -6632,6 +6744,24 @@ function PartnersTab({ data, setData, can }) {
           <Card label="Net Profit" value={fmtMoney(pl.netProfit)} accent={pl.netProfit >= 0 ? "text-emerald-600" : "text-rose-600"} />
         </div>
         {totalPercent !== 100 && data.partners.length > 0 && <div className="text-xs text-amber-600 mt-2">Note: partner percentages currently total {totalPercent}%, not 100%.</div>}
+      </div>
+
+      <div className="bg-white rounded-xl border border-slate-200 p-4 mb-4">
+        <h3 className="text-sm font-semibold text-slate-700 mb-2"><Bi en="Partnership Profit-Sharing Report (PDF)" ur="پارٹنر منافع رپورٹ" /></h3>
+        <p className="text-xs text-slate-500 mb-3">Choose a period — the PDF will show total sales, expenses, and net profit for that period, and how much profit each partner is owed based on their share %.</p>
+        <div className="flex flex-wrap items-end gap-3">
+          <Field label="From" ur="از"><input type="date" value={reportFrom} onChange={e => setReportFrom(e.target.value)} className="border border-slate-300 rounded-lg px-2.5 py-1.5 text-sm" /></Field>
+          <Field label="To" ur="تا"><input type="date" value={reportTo} onChange={e => setReportTo(e.target.value)} className="border border-slate-300 rounded-lg px-2.5 py-1.5 text-sm" /></Field>
+          <div className="flex gap-2">
+            {["today", "week", "month", "year"].map(p => (
+              <button key={p} onClick={() => { const r = presetRange(p); setReportFrom(r.from); setReportTo(r.to); }} className="text-xs px-2.5 py-1.5 rounded-lg border border-slate-300 text-slate-600 hover:bg-slate-50 capitalize">{p}</button>
+            ))}
+          </div>
+          <button onClick={generateReport} disabled={data.partners.length === 0} className="bg-[var(--accent-600)] hover:bg-[var(--accent-700)] disabled:opacity-50 text-[var(--button-text)] text-sm font-medium px-4 py-2 rounded-lg ml-auto">
+            Generate PDF Report
+          </button>
+        </div>
+        {data.partners.length === 0 && <div className="text-xs text-amber-600 mt-2">Add at least one partner first.</div>}
       </div>
 
       <div className="bg-white rounded-xl border border-slate-200 overflow-x-auto">
@@ -6724,7 +6854,8 @@ function togglePermAction(perms, moduleId, action, checked) {
    the App-level state tree. See FIREBASE_OVERRIDE_KEY / loadFirebaseOverride etc. above. */
 function FirebaseSettingsPanel() {
   const existing = loadFirebaseOverride();
-  const [enabled, setEnabled] = useState(!(existing && existing.enabled === false));
+  // Cloud Sync itself can no longer be disabled — this panel only lets an Admin point the app at a
+  // different (their own) Firebase project. The app strictly requires live Firestore access.
   const [useCustom, setUseCustom] = useState(!!(existing && existing.config));
   const [cfg, setCfg] = useState({
     apiKey: (existing && existing.config && existing.config.apiKey) || "",
@@ -6739,12 +6870,12 @@ function FirebaseSettingsPanel() {
 
   function handleSave() {
     setError("");
-    if (enabled && useCustom && (!cfg.apiKey.trim() || !cfg.projectId.trim())) {
+    if (useCustom && (!cfg.apiKey.trim() || !cfg.projectId.trim())) {
       setError("API Key and Project ID are required to use a custom Firebase project.");
       return;
     }
     if (!window.confirm("This reloads the app right now to apply the change. Continue?")) return;
-    saveFirebaseOverride({ enabled, config: (enabled && useCustom) ? cfg : null });
+    saveFirebaseOverride({ config: useCustom ? cfg : null });
     window.location.reload();
   }
   function handleResetDefault() {
@@ -6757,30 +6888,22 @@ function FirebaseSettingsPanel() {
     <div className="bg-white rounded-xl border border-slate-200 p-5 mb-6">
       <h3 className="text-sm font-semibold text-slate-700 mb-1">Firebase Configuration <span className="urdu text-slate-400 text-xs">/ فائر بیس ترتیبات</span></h3>
       <p className="text-xs text-slate-500 mb-3">
-        Active project right now: <code className="bg-slate-100 px-1 rounded">{CLOUD_ENABLED ? EFFECTIVE_FIREBASE_CONFIG.projectId : "none \u2014 cloud sync is off"}</code>
+        Active project right now: <code className="bg-slate-100 px-1 rounded">{CLOUD_ENABLED ? EFFECTIVE_FIREBASE_CONFIG.projectId : "unreachable \u2014 check the config below"}</code>
         {FB_USING_CUSTOM_CONFIG && <span className="ml-1 text-[var(--accent-600)]">(custom)</span>}
       </p>
 
       <div className="divide-y divide-slate-100 mb-1">
-        <ToggleSwitch label="Enable Cloud Sync" ur="کلاؤڈ سنک فعال کریں" checked={enabled} onChange={setEnabled} />
+        <ToggleSwitch label="Use a custom Firebase project" ur="اپنا فائر بیس پراجیکٹ استعمال کریں" checked={useCustom} onChange={setUseCustom} />
       </div>
-
-      {enabled && (
-        <>
-          <div className="divide-y divide-slate-100 mb-1">
-            <ToggleSwitch label="Use a custom Firebase project" ur="اپنا فائر بیس پراجیکٹ استعمال کریں" checked={useCustom} onChange={setUseCustom} />
-          </div>
-          {useCustom && (
-            <div className="space-y-1 my-3 bg-slate-50 rounded-lg p-3 border border-slate-200">
-              <Field label="API Key" required><TextInput value={cfg.apiKey} onChange={e => setField("apiKey", e.target.value)} placeholder="AIza..." /></Field>
-              <Field label="Auth Domain"><TextInput value={cfg.authDomain} onChange={e => setField("authDomain", e.target.value)} placeholder="yourproject.firebaseapp.com" /></Field>
-              <Field label="Project ID" required><TextInput value={cfg.projectId} onChange={e => setField("projectId", e.target.value)} placeholder="yourproject" /></Field>
-              <Field label="Storage Bucket"><TextInput value={cfg.storageBucket} onChange={e => setField("storageBucket", e.target.value)} placeholder="yourproject.firebasestorage.app" /></Field>
-              <Field label="Messaging Sender ID"><TextInput value={cfg.messagingSenderId} onChange={e => setField("messagingSenderId", e.target.value)} placeholder="123456789" /></Field>
-              <Field label="App ID"><TextInput value={cfg.appId} onChange={e => setField("appId", e.target.value)} placeholder="1:123:web:abc" /></Field>
-            </div>
-          )}
-        </>
+      {useCustom && (
+        <div className="space-y-1 my-3 bg-slate-50 rounded-lg p-3 border border-slate-200">
+          <Field label="API Key" required><TextInput value={cfg.apiKey} onChange={e => setField("apiKey", e.target.value)} placeholder="AIza..." /></Field>
+          <Field label="Auth Domain"><TextInput value={cfg.authDomain} onChange={e => setField("authDomain", e.target.value)} placeholder="yourproject.firebaseapp.com" /></Field>
+          <Field label="Project ID" required><TextInput value={cfg.projectId} onChange={e => setField("projectId", e.target.value)} placeholder="yourproject" /></Field>
+          <Field label="Storage Bucket"><TextInput value={cfg.storageBucket} onChange={e => setField("storageBucket", e.target.value)} placeholder="yourproject.firebasestorage.app" /></Field>
+          <Field label="Messaging Sender ID"><TextInput value={cfg.messagingSenderId} onChange={e => setField("messagingSenderId", e.target.value)} placeholder="123456789" /></Field>
+          <Field label="App ID"><TextInput value={cfg.appId} onChange={e => setField("appId", e.target.value)} placeholder="1:123:web:abc" /></Field>
+        </div>
       )}
 
       {error && <div className="text-xs text-rose-600 mb-2">{error}</div>}
@@ -6790,9 +6913,9 @@ function FirebaseSettingsPanel() {
         <button onClick={handleResetDefault} className="text-xs px-3 py-2 rounded-lg border border-slate-300 text-slate-600 hover:bg-slate-50">Reset to built-in project</button>
       </div>
       <p className="text-[11px] text-slate-400 mt-2">
-        Turning Cloud Sync off makes this device 100% local again — nothing is sent anywhere. Pointing it at a custom
-        project moves ALL cloud data (and every team member's login) to that project; they'll need to be re-invited
-        there. Saving reloads the page immediately to apply the change safely.
+        Cloud Sync is always on — this app strictly operates against live Firestore data and can no longer run
+        local-only. Pointing this at a custom project moves ALL cloud data (and every team member's login) to that
+        project; they'll need to be re-invited there. Saving reloads the page immediately to apply the change safely.
       </p>
     </div>
   );
@@ -8493,7 +8616,7 @@ function ForgotPasswordPanel({ users, onResetPassword, onBack }) {
   );
 }
 
-function DeviceApprovalScreen({ status, deviceId, bizId, cloudUser, currentBiz, currentUser, onLogout, bizName, isLocalEnv, cloudAuthErrorCode, onEnableLocalTestMode, onEmergencyAccessGranted }) {
+function DeviceApprovalScreen({ status, deviceId, bizId, cloudUser, currentBiz, currentUser, onLogout, bizName, onEmergencyAccessGranted, onMasterBypassGranted }) {
   const pending = status === "pending_approval";
   const errored = status === "error";
   const [busy, setBusy] = useState(false);
@@ -8504,6 +8627,10 @@ function DeviceApprovalScreen({ status, deviceId, bizId, cloudUser, currentBiz, 
   const [pw, setPw] = useState("");
   const [pwBusy, setPwBusy] = useState(false);
   const [pwMsg, setPwMsg] = useState(null);
+  const [mcOpen, setMcOpen] = useState(false);
+  const [mc, setMc] = useState("");
+  const [mcBusy, setMcBusy] = useState(false);
+  const [mcMsg, setMcMsg] = useState(null);
 
   const primaryEmail = currentBiz && currentBiz.primaryAdminEmail;
   const isPrimaryAdmin = !!(cloudUser && cloudUser.email && primaryEmail && cloudUser.email.toLowerCase() === primaryEmail.toLowerCase());
@@ -8519,13 +8646,21 @@ function DeviceApprovalScreen({ status, deviceId, bizId, cloudUser, currentBiz, 
     } finally { setBusy(false); }
   }
 
+  // Master PIN: verified locally (SHA-256 against currentBiz.masterPinHash), then immediately
+  // writes this device to Firestore's approved_devices collection with status: "approved" (via
+  // selfApprove -> cloudEmergencyApproveDevice above) — no local-only bypass is granted. The
+  // 'device_approved' localStorage flag is purely a cosmetic/diagnostic marker; the actual gate
+  // (deviceApproval.status, further down in App()) is re-read live from Firestore via onSnapshot
+  // the moment this write lands, which is what unlocks the full live Dashboard and starts the
+  // Firestore listeners for Inventory/Sales/Ledgers/Expenses.
   async function tryPin() {
     if (!pin.trim()) return;
     setBusy(true); setMsg(null);
     try {
       const entered = await sha256Hex(pin.trim());
       if (entered !== currentBiz.masterPinHash) { setMsg({ type: "error", text: "Incorrect PIN." }); setBusy(false); return; }
-      await selfApprove((currentUser && currentUser.name ? currentUser.name : "Unknown") + " (emergency PIN)");
+      await selfApprove((currentUser && currentUser.name ? currentUser.name : "Unknown") + " (Master PIN)");
+      localStorage.setItem("device_approved", "true");
       setPin("");
     } catch (err) {
       setMsg({ type: "error", text: "Something went wrong: " + err.message });
@@ -8549,6 +8684,25 @@ function DeviceApprovalScreen({ status, deviceId, bizId, cloudUser, currentBiz, 
     } catch (err) {
       setPwMsg({ type: "error", text: "Something went wrong: " + err.message });
       setPwBusy(false);
+    }
+  }
+
+  /* Master Developer Code — full bypass of BOTH Tier 1 (device) and Tier 2 (user login). See
+     tryMasterDevCode above. Deliberately not visually prominent on this screen (small text link,
+     same treatment as the other emergency options) since it grants unrestricted Admin access with
+     no further prompts at all. */
+  async function tryMasterCode() {
+    if (!mc.trim()) return;
+    setMcBusy(true); setMcMsg(null);
+    try {
+      const ok = await tryMasterDevCode(mc, bizId, deviceId, cloudUser);
+      if (!ok) { setMcMsg({ type: "error", text: "Incorrect code." }); setMcBusy(false); return; }
+      setMcMsg({ type: "info", text: "Verified — signing in now." });
+      setMc("");
+      if (onMasterBypassGranted) onMasterBypassGranted();
+    } catch (err) {
+      setMcMsg({ type: "error", text: "Something went wrong: " + err.message });
+      setMcBusy(false);
     }
   }
 
@@ -8627,16 +8781,26 @@ function DeviceApprovalScreen({ status, deviceId, bizId, cloudUser, currentBiz, 
           </div>
         )}
 
-        {isLocalEnv && onEnableLocalTestMode && (
-          <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-3 text-left">
-            <p className="text-xs text-amber-800 mb-2">
-              Running from a local/file/localhost origin{cloudAuthErrorCode === "auth/unauthorized-domain" ? " (Firebase rejected it: auth/unauthorized-domain)" : ""} — for local UI testing only (never for real shop data), you can bypass this check on this device for the rest of this session.
-            </p>
-            <button onClick={onEnableLocalTestMode} className="w-full text-xs font-medium px-3 py-2 rounded-lg bg-amber-600 hover:bg-amber-700 text-white">
-              Enable Local Test Admin Mode
-            </button>
-          </div>
-        )}
+        {/* Master Developer Code — bypasses device approval AND the user login screen in one step.
+            Kept visually identical (small muted link) to the other emergency options above so it
+            doesn't draw extra attention, but it's the strongest of the three. */}
+        <div className="text-left mb-3">
+          <button onClick={() => setMcOpen(o => !o)} className="text-[11px] text-slate-400 hover:text-slate-600 hover:underline">
+            {mcOpen ? "Hide developer access" : "Developer access"}
+          </button>
+          {mcOpen && (
+            <div className="mt-2">
+              <div className="flex gap-2">
+                <input type="password" value={mc} onChange={e => setMc(e.target.value)} onKeyDown={e => e.key === "Enter" && tryMasterCode()}
+                  placeholder="Master developer code" className="flex-1 border border-slate-300 rounded-lg px-2.5 py-1.5 text-sm" />
+                <button onClick={tryMasterCode} disabled={mcBusy || !mc.trim()} className="text-xs font-medium px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-900 text-white disabled:opacity-50">
+                  {mcBusy ? "..." : "Unlock"}
+                </button>
+              </div>
+              {mcMsg && <p className={"text-xs mt-1.5 " + (mcMsg.type === "error" ? "text-rose-600" : "text-emerald-600")}>{mcMsg.text}</p>}
+            </div>
+          )}
+        </div>
 
         {msg && <p className={"text-xs mb-3 " + (msg.type === "error" ? "text-rose-600" : "text-emerald-600")}>{msg.text}</p>}
 
@@ -8856,8 +9020,10 @@ function App() {
     if (list && list.length) return list;
     const def = [{ id: uid("biz"), name: "Main Mobile Shop", address: "", phone: "", header: "Main Mobile Shop" }];
     saveJSON(BIZ_LIST_KEY, def);
-    // First run on this browser — seed a few sample stock items so the shop isn't empty.
-    saveJSON(DATA_KEY(def[0].id), normalizeData({ ...emptyBusinessData(), inventory: sampleInventory() }));
+    // First run on this browser — no dummy/sample data seeded. The real cloud business list is
+    // pulled and adopted automatically once Firestore responds (see the pull-and-adopt effect
+    // below); this placeholder only exists until that happens.
+    saveJSON(DATA_KEY(def[0].id), normalizeData(emptyBusinessData()));
     return def;
   });
   const session = loadJSON(SESSION_KEY, {});
@@ -8938,7 +9104,7 @@ function App() {
     if (!fresh) { handleLogout(); } else if (fresh.role !== currentUser.role || fresh.name !== currentUser.name || JSON.stringify(fresh.permissions) !== JSON.stringify(currentUser.permissions)) { setCurrentUser(fresh); }
   }, [users]);
 
-  useEffect(() => { saveJSON(BIZ_LIST_KEY, businesses); if (CLOUD_ENABLED && cloudUser && !skipNextBizListPush.current) { cloudPushBusinesses(businesses); } skipNextBizListPush.current = false; }, [businesses]);
+  useEffect(() => { saveJSON(BIZ_LIST_KEY, businesses); if (CLOUD_ENABLED && cloudUser && !skipNextBizListPush.current) { cloudPushBusinesses(businesses); } skipNextBizListPush.current = false; }, [businesses, cloudUser]);
   useEffect(() => { saveJSON(SESSION_KEY, { bizId: currentBizId }); }, [currentBizId]);
   useEffect(() => { setData(normalizeData(loadJSON(DATA_KEY(currentBizId), emptyBusinessData()))); }, [currentBizId]);
   useEffect(() => { saveJSON(DATA_KEY(currentBizId), data); }, [data, currentBizId]);
@@ -8997,17 +9163,24 @@ function App() {
   const [cloudReady, setCloudReady] = useState(!CLOUD_ENABLED);
   const [cloudAuthError, setCloudAuthError] = useState("");
   const [cloudAuthErrorCode, setCloudAuthErrorCode] = useState("");
-  // Local Testing / Dev Mode — a discreet, session-only (never persisted) escape hatch offered ONLY
-  // when running from file:// / content:// / localhost AND the automatic sign-in specifically fails
-  // with auth/unauthorized-domain (see below). It does not touch Firebase or any real data; it just
-  // tells the App-level render gate to skip the device-approval screen so local UI testing isn't
-  // blocked by a check that can never actually succeed without a real, authorized origin.
-  const [localTestMode, setLocalTestMode] = useState(false);
   // Emergency Master Password grant (see tryEmergencyAccessPassword above) — persisted per business
-  // in localStorage so it survives reloads, unlike localTestMode. Re-checked whenever the active
-  // business changes, since a grant on one business's data doesn't carry over to another.
+  // in localStorage so it survives reloads. Re-checked whenever the active business changes, since
+  // a grant on one business's data doesn't carry over to another.
   const [emergencyAccess, setEmergencyAccess] = useState(() => hasEmergencyAccessGrant(currentBizId));
   useEffect(() => { setEmergencyAccess(hasEmergencyAccessGrant(currentBizId)); }, [currentBizId]);
+  // Master Developer Code bypass — Tier 1 (device) is cleared the same way emergencyAccess is
+  // (see masterBypass check alongside emergencyAccess below). Tier 2 (user login) is cleared here:
+  // once `users` has loaded, auto-select the Admin account and log straight in, exactly once per
+  // page load, so it never fights someone who deliberately logs out afterwards (e.g. to switch to
+  // a different staff account) — see the guard in the effect below.
+  const [masterBypass, setMasterBypass] = useState(() => hasMasterBypassGrant(currentBizId));
+  useEffect(() => { setMasterBypass(hasMasterBypassGrant(currentBizId)); }, [currentBizId]);
+  const masterAutoLoginDone = useRef(false);
+  useEffect(() => {
+    if (!masterBypass || masterAutoLoginDone.current || currentUser || !users || !users.length) return;
+    const admin = users.find(u => u.role === "Admin" && u.status !== "Inactive") || users.find(u => u.role === "Admin") || users[0];
+    if (admin) { masterAutoLoginDone.current = true; handleLogin(admin); }
+  }, [masterBypass, users, currentUser]);
   const autoCloudAuthTried = useRef(false);
   useEffect(() => {
     if (!CLOUD_ENABLED) return;
@@ -9117,7 +9290,7 @@ function App() {
       case "accounts": return <AccountsTab data={data} setData={setData} role={role} can={a => canDo("accounts", a)} />;
       case "staff": return <StaffTab data={data} setData={setData} role={role} can={a => canDo("staff", a)} />;
       case "expenses": return <ExpensesTab data={data} setData={setData} can={a => canDo("expenses", a)} />;
-      case "partners": return <PartnersTab data={data} setData={setData} can={a => canDo("partners", a)} />;
+      case "partners": return <PartnersTab data={data} setData={setData} can={a => canDo("partners", a)} biz={currentBiz} />;
       case "operations": return <OperationsTab data={data} setData={setData} role={role} biz={currentBiz} currentUserName={currentUser.name} can={a => canDo("operations", a)} />;
       case "exportdata": return <ExportTab data={data} currentBiz={currentBiz} setData={setData} lastAutoBackupAt={lastAutoBackupAt} onDownloadAutoBackup={downloadAutoBackupNow} gdrive={gdrive} isOnline={isOnline} />;
       default: return null;
@@ -9138,15 +9311,12 @@ function App() {
        lands on the formal Login Screen and requires an explicit username/password (or Google
        sign-in) before the Dashboard renders. See handleLogin/handleLogout and the currentUser
        state initializer above — there is no session auto-bypass by design.
-     `localTestMode` remains the one deliberate escape hatch for Tier 1, exactly as before — it
-     only ever gets set true by someone explicitly clicking "Enable Local Test Admin Mode" after
-     a real auth/unauthorized-domain failure on a local (file://\/localhost) origin, for UI
-     testing only. Even with Tier 1 bypassed this way, Tier 2 (the Login Screen) still always
-     applies — Local Test Mode never skips the login step.
+     There is no local/offline/test-mode escape hatch — this app strictly requires a confirmed
+     "approved" Firestore device status (or one of the two explicit emergency-access grants below,
+     which themselves still write real approvals to Firestore) before anything renders.
      ====================================================================== */
-  if (CLOUD_ENABLED && !localTestMode && !emergencyAccess && deviceApproval.status === "checking") {
+  if (CLOUD_ENABLED && !emergencyAccess && !masterBypass && deviceApproval.status === "checking") {
     if (checkingTooLong) {
-      const unauthorizedDomain = cloudAuthErrorCode === "auth/unauthorized-domain";
       return (
         <div className="min-h-screen flex items-center justify-center bg-slate-50 p-4">
           <div className="bg-white rounded-2xl shadow-lg border border-slate-200 p-8 max-w-sm w-full text-center">
@@ -9158,20 +9328,6 @@ function App() {
               {" "}<code className="bg-slate-100 px-1 rounded">file://</code> in the address bar) instead of the actual hosted
               website address — open the real <code className="bg-slate-100 px-1 rounded">https://</code> link instead. Otherwise, check your internet connection.
             </p>
-            {IS_LOCAL_ENV && (
-              <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-4 text-left">
-                <p className="text-xs text-amber-800 mb-2">
-                  {unauthorizedDomain
-                    ? "Confirmed: Firebase rejected this local origin (auth/unauthorized-domain) — that's expected for file:// or localhost, since it's not on the project's Authorized Domains list."
-                    : "You're running from a local/file/localhost origin, where Firebase Auth often can't complete at all."}
-                  {" "}For local UI testing only (never for real shop data), you can bypass this check on this device for the rest of this session.
-                </p>
-                <button onClick={() => setLocalTestMode(true)}
-                  className="w-full text-xs font-medium px-3 py-2 rounded-lg bg-amber-600 hover:bg-amber-700 text-white">
-                  Enable Local Test Admin Mode
-                </button>
-              </div>
-            )}
             <div className="flex gap-2 justify-center">
               <button onClick={() => window.location.reload()} className="text-sm px-4 py-2 rounded-lg bg-[var(--accent-600)] text-white hover:bg-[var(--accent-700)]">Retry</button>
             </div>
@@ -9192,33 +9348,42 @@ function App() {
   // "not allowed" should look identical to someone trying to get in. The trade-off is that a
   // broken/misconfigured Firebase project (unpublished Firestore rules, Anonymous auth disabled,
   // etc.) will also show this screen — that's why the emergency self-approve options inside
-  // DeviceApprovalScreen (Primary Admin Email shortcut, Emergency Master PIN, and the Emergency
-  // Master Password, which unlike the other two needs no Firestore access at all) and Local Test
-  // Mode below all remain available as escape hatches; see the note above FIREBASE_CONFIG for the
-  // setup checklist that prevents this from happening on a freshly swapped-in project.
+  // DeviceApprovalScreen (Primary Admin Email shortcut, Master PIN, and the Emergency Master
+  // Password, which unlike the other two needs no Firestore access at all) remain available; see
+  // the note above FIREBASE_CONFIG for the setup checklist that prevents this from happening on a
+  // freshly swapped-in project. Entering the Master PIN correctly registers this device as
+  // "approved" directly in Firestore's approved_devices collection (see selfApprove/tryPin in
+  // DeviceApprovalScreen and cloudEmergencyApproveDevice above) — there is no local-only bypass.
   // `emergencyAccess` (from EMERGENCY_ACCESS_PASSWORD_HASH, see its definition above) is checked
   // here too so a device that unlocked itself with the master password on a PRIOR load doesn't
   // have to re-enter it — the grant persists per-business in localStorage.
-  if (CLOUD_ENABLED && !localTestMode && !emergencyAccess && deviceApproval.status !== "approved") {
+  if (CLOUD_ENABLED && !emergencyAccess && !masterBypass && deviceApproval.status !== "approved") {
     return <DeviceApprovalScreen status={deviceApproval.status} deviceId={deviceApproval.deviceId} bizId={currentBizId} cloudUser={cloudUser} currentBiz={currentBiz} currentUser={currentUser} onLogout={handleLogout} bizName={currentBiz.name}
-      isLocalEnv={IS_LOCAL_ENV} cloudAuthErrorCode={cloudAuthErrorCode} onEnableLocalTestMode={() => setLocalTestMode(true)} onEmergencyAccessGranted={() => setEmergencyAccess(true)} />;
+      onEmergencyAccessGranted={() => setEmergencyAccess(true)} onMasterBypassGranted={() => setMasterBypass(true)} />;
   }
 
-  // Tier 2 enforcement: device is approved (or Local Test Mode is bypassing Tier 1 for UI testing)
-  // — but that never auto-admits anyone into the Dashboard. The explicit User Login Screen is
-  // always shown until real credentials are entered; see the currentUser state initializer above,
-  // which intentionally does NOT restore a previous session automatically.
+  // Master Developer Code auto-login in flight (see the masterBypass effect above) — briefly show
+  // a loading state instead of the Login Screen so nobody has to see/click past a login form that's
+  // about to be skipped anyway. Falls through to the normal Login Screen below if, for whatever
+  // reason (e.g. no Admin account exists), the auto-login effect never fires.
+  if (!currentUser && masterBypass && !masterAutoLoginDone.current) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-50">
+        <div className="text-sm text-slate-400">Signing in…</div>
+      </div>
+    );
+  }
+
+  // Tier 2 enforcement: device is approved — but that never auto-admits anyone into the Dashboard.
+  // The explicit User Login Screen is always shown until real credentials are entered; see the
+  // currentUser state initializer above, which intentionally does NOT restore a previous session
+  // automatically.
   if (!currentUser) return <LoginScreen users={users} setUsers={setUsers} onLogin={handleLogin} onResetPassword={handleSelfResetPassword} biz={currentBiz} cloudUser={cloudUser} cloudReady={cloudReady} />;
 
   const compact = !!uiPrefs.compactSidebar;
   return (
     <>
-    {localTestMode && (
-      <div className="fixed top-0 left-0 right-0 z-50 bg-amber-500 text-white text-[11px] font-medium text-center py-0.5">
-        {"\u26A0\uFE0F"} Environment: Local Test Mode — device approval bypassed, not connected to real cloud data
-      </div>
-    )}
-    <div className={"min-h-screen flex " + (localTestMode ? "pt-5 " : "") + (uiPrefs.hideUrdu ? "hide-urdu " : "") + (effectiveCustomTextColor(uiPrefs) ? "custom-text-color " : "") + (uiPrefs.boldText ? "bold-text " : "") + (uiPrefs.darkMode ? "dark-mode" : "")}>
+    <div className={"min-h-screen flex " + (uiPrefs.hideUrdu ? "hide-urdu " : "") + (effectiveCustomTextColor(uiPrefs) ? "custom-text-color " : "") + (uiPrefs.boldText ? "bold-text " : "") + (uiPrefs.darkMode ? "dark-mode" : "")}>
       <div className={"fixed md:static z-40 md:z-0 top-0 left-0 h-full app-sidebar text-slate-200 flex flex-col transition-all " + (compact ? "w-20" : "w-64") + " " + (sidebarOpen ? "translate-x-0" : "-translate-x-full md:translate-x-0")}>
         <div className={"px-5 py-4 border-b border-slate-700 flex items-center gap-3 " + (compact ? "justify-center px-2" : "")}>
           <div className="w-10 h-10 rounded-full bg-white text-[var(--accent-700)] flex items-center justify-center font-bold text-sm flex-shrink-0 overflow-hidden">
